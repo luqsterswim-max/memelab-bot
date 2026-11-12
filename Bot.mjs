@@ -1,5 +1,5 @@
 // MemeLab AI — paper trading bot v1 (NO real money, NO wallet, NO private keys)
-// Run:  npm i @supabase/supabase-js   then   node bot.mjs      (Node 18+)
+// Run:  npm i @supabase/supabase-js   then   node Bot.mjs      (Node 18+)
 import { createClient } from "@supabase/supabase-js";
 
 const URL_ = process.env.SUPABASE_URL || "https://wduflmaakgoemxsegnbp.supabase.co";
@@ -15,7 +15,14 @@ const STOP = 0.65;                             // stop-loss at -35% (before targ
 const TRAIL = 0.70;                            // after target: sell rest if price < 70% of peak
 const FEE = 0.005, SLIP = 0.015;               // simulated costs (0.5% + 1.5%)
 
-const db = createClient(URL_, KEY, { auth: { persistSession: false, autoRefreshToken: true } });
+let step = "start";
+let db;
+try {
+  db = createClient(URL_, KEY, { auth: { persistSession: false, autoRefreshToken: true } });
+} catch (e) {
+  console.log("::error::[createClient] " + String(e?.message || e).replace(/\s+/g, " "));
+  process.exit(1);
+}
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let USER = null;
@@ -134,14 +141,17 @@ async function scan(S) {
   const h = new Date().getUTCHours();
   const minScore = picks >= DAILY_PICKS ? 70 : h >= 18 ? 45 : h >= 12 ? 55 : 70;   // relaxes score only, never the risk filters
   const known = new Set(S.tokens.map(t => t.mint_address));
+  step = "discover tokens";
   const addrs = (await discover()).filter(a => !known.has(a));
   log(`scan: ${addrs.length} new candidates, min score ${minScore}`);
+  step = "fetch pair data";
   const ev = Object.values(bestPair(await pairsFor(addrs))).map(p => ({ p, ...evaluate(p) }));
   const ok = ev.filter(e => !e.risks.length).sort((a, b) => b.score - a.score);
   log(`passed risk filters: ${ok.length}/${ev.length}; rejected: ${ev.length - ok.length}`);
   const open = Object.values(positions(S)).filter(p => p.qty > 1e-8).length;
   let freeSlots = MAX_OPEN - open, c = cash(S);
 
+  step = "save picks";
   for (const e of ok.filter(e => e.score >= minScore).slice(0, Math.max(0, DAILY_PICKS - picks))) {
     const tok = await addToken(e.p);
     if (freeSlots <= 0 || c < POS) { await decide(tok.id, "POCZEKAĆ", `score ${e.score}/100 but no free slot or cash. ${e.note}`); log("WAIT (no cash/slot)", tok.ticker); continue; }
@@ -189,14 +199,21 @@ async function manage(S) {
 }
 
 async function main() {
-  if (!BOT_EMAIL || !BOT_PASSWORD) throw new Error("Set BOT_EMAIL and BOT_PASSWORD (your MemeLab login).");
+  if (!BOT_EMAIL || !BOT_PASSWORD) throw new Error("secret BOT_EMAIL or BOT_PASSWORD is empty");
+  step = "login";
   const r = await db.auth.signInWithPassword({ email: BOT_EMAIL, password: BOT_PASSWORD });
-  if (r.error) throw r.error;
+  if (r.error) throw new Error(r.error.message);
   USER = r.data.user.id;
   log("bot started (paper trading only), user", r.data.user.email);
   if (process.argv.includes("--once")) {          // single run (for GitHub Actions / cron)
-    await manage(await load());
-    await scan(await load());
+    step = "load data";
+    const S1 = await load();
+    step = "manage positions";
+    await manage(S1);
+    step = "load data (scan)";
+    const S2 = await load();
+    step = "scan";
+    await scan(S2);
     log("run finished");
     return;
   }
@@ -209,4 +226,7 @@ async function main() {
     await sleep(5 * 60e3);
   }
 }
-main().catch(e => { console.error(e); process.exit(1); });
+main().catch(e => {
+  console.log("::error::[" + step + "] " + String(e?.message || e).replace(/\s+/g, " "));
+  process.exit(1);
+});
