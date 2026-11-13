@@ -9,14 +9,15 @@ const { BOT_EMAIL, BOT_PASSWORD } = process.env;
 // ================= SETTINGS (change freely) =================
 const num = (k, d) => (process.env[k] !== undefined && process.env[k] !== "" ? +process.env[k] : d);
 
-// -- position sizing (% of portfolio equity, scaled by signal score) --
-const MIN_PCT = num("MIN_PCT", 0.05);          // weakest accepted signal  -> 5% of portfolio
-const MAX_PCT = num("MAX_PCT", 0.30);          // strongest signal         -> 30% of portfolio
+// -- position sizing (% of portfolio equity, depends on RISK level) --
+const PCT_LOW = num("PCT_LOW", 0.30);          // low risk    -> 30% of portfolio
+const PCT_MED = num("PCT_MED", 0.15);          // medium risk -> 15% of portfolio
+const PCT_HIGH = num("PCT_HIGH", 0.05);        // high risk   -> 5% of portfolio
 const MAX_EXPOSURE = num("MAX_EXPOSURE", 0.80);// total open positions never above 80% of portfolio
 const MIN_USD = num("MIN_USD", 10);            // never enter with less than this
 const MAX_USD = num("MAX_USD", 0);             // optional hard cap per entry in USD (0 = off)
-const MAX_OPEN = num("MAX_OPEN", 4);           // max open positions at once
-const DAILY_PICKS = 2, DAILY_WATCH = 3;        // coins to ENTER / WAIT per day
+const MAX_OPEN = num("MAX_OPEN", 8);           // max open positions at once
+const DAILY_PICKS = 7, DAILY_WATCH = 18;       // coins to ENTER / WAIT per day
 
 // -- exits --
 const PARTIAL_X = num("PARTIAL_X", 1.5);       // sell 50% at 1.5x
@@ -87,7 +88,7 @@ async function discover() {
 // ---- costs: slippage grows when the trade is large vs liquidity ----
 const slipRate = (usd, liq) => clamp(SLIP + (liq > 0 ? usd / liq : 0.1), SLIP, 0.20);
 
-// ---- analysis: hard risk filters first, then a 0-100 score ----
+// ---- analysis: hard risk filters first, then a 0-100 score + risk level ----
 function evaluate(p) {
   const liq = p.liquidity?.usd || 0, vol = p.volume?.h24 || 0, mc = p.marketCap || p.fdv || 0;
   const age = (Date.now() - (p.pairCreatedAt || Date.now())) / 36e5;
@@ -110,19 +111,27 @@ function evaluate(p) {
     + (ch1 > 0 && ch1 <= 60 ? 15 : ch1 > 60 ? 8 : 0)                     // healthy momentum
     + (ch6 > 0 ? 10 : 0) + (age >= 2 && age <= 48 ? 10 : 0);
   score = Math.round(score);
-  const note = `liq $${Math.round(liq)}, vol24h $${Math.round(vol)}, mcap $${Math.round(mc)}, age ${age.toFixed(1)}h, buys/sells 1h ${b}/${s}, 1h ${ch1}%`;
-  return { score, risks, note };
+
+  // risk points -> risk level (decides position size)
+  let rp = 0;
+  if (liq < 30000) rp++;                         // thin liquidity
+  if (ch1 > 60) rp++;                            // fast pump
+  if (age < 3) rp++;                             // very young token
+  if (mc && liq / mc < 0.06) rp++;               // low liquidity vs market cap
+  if (s > b * 1.1) rp++;                         // sellers slightly ahead
+  if (mc < 200000) rp++;                         // small market cap
+  const level = rp >= 4 ? "HIGH" : rp >= 2 ? "MEDIUM" : "LOW";
+
+  const note = `risk ${level} (${rp} pts), liq $${Math.round(liq)}, vol24h $${Math.round(vol)}, mcap $${Math.round(mc)}, age ${age.toFixed(1)}h, buys/sells 1h ${b}/${s}, 1h ${ch1}%`;
+  return { score, risks, note, level, rp };
 }
 
-// ---- dynamic position size: bigger for strong/safe signals, smaller for weak/risky ----
+// ---- position size depends on risk level: low risk = bigger, high risk = smaller ----
 function sizeFor(e, equity, invested, cashLeft) {
-  const p = e.p, liq = p.liquidity?.usd || 0, ch1 = p.priceChange?.h1 || 0;
-  let pct = MIN_PCT + clamp((e.score - 45) / 55, 0, 1) * (MAX_PCT - MIN_PCT);
-  if (ch1 > 60) pct *= 0.7;            // already running hot
-  if (liq < 30000) pct *= 0.8;         // thin liquidity
+  const pct = e.level === "LOW" ? PCT_LOW : e.level === "MEDIUM" ? PCT_MED : PCT_HIGH;
   let usd = equity * pct;
   if (MAX_USD > 0) usd = Math.min(usd, MAX_USD);
-  usd = Math.min(usd, equity * MAX_EXPOSURE - invested, cashLeft);   // 80% total exposure cap
+  usd = Math.min(usd, equity * MAX_EXPOSURE - invested, cashLeft);   // total exposure cap
   usd = Math.floor(usd * 100) / 100;
   return { usd: usd >= MIN_USD ? usd : 0, pct };
 }
@@ -223,9 +232,9 @@ async function scan(S) {
     if (freeSlots <= 0 || !usd) { await decide(tok.id, "POCZEKAĆ", `score ${e.score}/100 but no free slot, cash or exposure room. ${e.note}`); log("WAIT (no cash/slot/exposure)", tok.ticker); continue; }
     await snapshot(tok.id, e.p);
     await paperBuy(tok.id, tok.ticker, +e.p.priceUsd, usd, e.p.liquidity?.usd || 0);
-    await decide(tok.id, "WEJŚĆ", `score ${e.score}/100, size $${usd.toFixed(2)} (${(usd / equity * 100).toFixed(1)}% of portfolio, base ${(pct * 100).toFixed(1)}%). ${e.note}`,
-      `Sell 50% at ${PARTIAL_X}x, then break-even stop + trailing stop on the rest`, `Stop-loss at -${Math.round((1 - STOP) * 100)}%. Memecoin: can go to zero.`);
-    freeSlots--; c -= usd; invested += usd; log("ENTER", tok.ticker, "score", e.score, "size $" + usd.toFixed(2));
+    await decide(tok.id, "WEJŚĆ", `score ${e.score}/100, risk ${e.level}, size $${usd.toFixed(2)} (${(usd / equity * 100).toFixed(1)}% of portfolio, base ${(pct * 100).toFixed(1)}%). ${e.note}`,
+      `Sell 50% at ${PARTIAL_X}x, then break-even stop + trailing stop on the rest`, `Risk level ${e.level}. Stop-loss at -${Math.round((1 - STOP) * 100)}%. Memecoin: can go to zero.`);
+    freeSlots--; c -= usd; invested += usd; log("ENTER", tok.ticker, "score", e.score, "risk", e.level, "size $" + usd.toFixed(2));
   }
   for (const e of ok.filter(e => e.score >= 45 && e.score < minScore).slice(0, Math.max(0, DAILY_WATCH - waits))) {
     const tok = await tokenFor(S, e.p);
@@ -315,4 +324,3 @@ main().catch(e => {
   console.log("::error::[" + step + "] " + String(e?.message || e).replace(/\s+/g, " "));
   process.exit(1);
 });
-
