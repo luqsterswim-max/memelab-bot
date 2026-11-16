@@ -1,9 +1,10 @@
-// MemeLab AI — paper trading bot v8 (NO real money, NO wallet, NO private keys)
-// v8: pullback entry, liquidity-drop exit, many more token sources (DexScreener + GeckoTerminal + search),
-//     positions are still checked while the scan runs. (+ v7: --minutes loop, dead-pair exit, creator ban,
-//     backtest, 2nd partial, size scaling, holder filter, daily report)
+// MemeLab AI — paper trading bot v9 (NO real money, NO wallet, NO private keys)
+// v9: loss re-entry ban, exit-reason statistics, entry pause after a losing streak, time stop,
+//     position size capped by liquidity, smaller default positions, 24/7 hardening
+//     (request timeouts, watchdog, auto re-login). (+ v8: pullback entry, liquidity-drop exit, many token
+//     sources, creator ban, backtest, 2 partial sells, size scaling, holder filter, daily report)
 // Run:  npm i @supabase/supabase-js
-//   node Bot.mjs --minutes=345   (loop for N minutes, then exit; use with GitHub Actions)
+//   node Bot.mjs --minutes=345   (loop for N minutes, then exit; use with GitHub Actions, 24/7)
 //   node Bot.mjs                 (loop forever, e.g. on a server)
 //   node Bot.mjs --once          (one pass; pullback entry is off in this mode)
 //   node Bot.mjs --backtest      (replays saved snapshots with many exit settings)
@@ -18,27 +19,35 @@ const ONCE = process.argv.includes("--once");
 // ================= SETTINGS (change freely, or override with env vars) =================
 const num = (k, d) => (process.env[k] !== undefined && process.env[k] !== "" ? +process.env[k] : d);
 
-// -- position sizing --
-const PCT_LOW = num("PCT_LOW", 0.30);
-const PCT_MED = num("PCT_MED", 0.15);
-const PCT_HIGH = num("PCT_HIGH", 0.05);
+// -- position sizing (smaller than before while the strategy is being proven) --
+const PCT_LOW = num("PCT_LOW", 0.10);
+const PCT_MED = num("PCT_MED", 0.07);
+const PCT_HIGH = num("PCT_HIGH", 0.03);
 const MAX_POS_PCT = num("MAX_POS_PCT", 0.35);
 const MAX_EXPOSURE = num("MAX_EXPOSURE", 0.80);
-const MIN_USD = num("MIN_USD", 10);
+const MAX_LIQ_PCT = num("MAX_LIQ_PCT", 0.02);   // one position never exceeds this share of the token's liquidity (0 = off)
+const MIN_USD = num("MIN_USD", 5);
 const MAX_USD = num("MAX_USD", 0);
 const MAX_OPEN = num("MAX_OPEN", 8);
+const ALLOW_HIGH = num("ALLOW_HIGH", 1);        // 0 = never enter tokens rated risk HIGH
 
 // -- size scaling --
 const SCALE_SCORE = num("SCALE_SCORE", 1);
 const SCALE_STREAK = num("SCALE_STREAK", 1);
 
+// -- protection against repeating mistakes --
+const LOSS_BAN_H = num("LOSS_BAN_H", 168);      // token closed at a loss is not bought again for this many hours (0 = off)
+const PAUSE_LOSSES = num("PAUSE_LOSSES", 4);    // after this many losing trades in a row...
+const PAUSE_MIN = num("PAUSE_MIN", 30);         // ...no new entries for this many minutes after the last loss (0 = off)
+const TIME_STOP_H = num("TIME_STOP_H", 3);      // exit a position that never reached +10% within this many hours (0 = off)
+
 // -- scanning / token sources --
 const SCAN_SEC = num("SCAN_SEC", 300);
 const MIN_SCORE = num("MIN_SCORE", 60);
 const WATCH_MIN = num("WATCH_MIN", 45);
-const MAX_CAND = num("MAX_CAND", 300);          // max candidates checked per scan
-const GECKO = num("GECKO", 1);                  // 1 = also use GeckoTerminal (new / trending / top volume pools)
-const SEARCH_ON = num("SEARCH_ON", 1);          // 1 = also use DexScreener search with keywords
+const MAX_CAND = num("MAX_CAND", 300);
+const GECKO = num("GECKO", 1);
+const SEARCH_ON = num("SEARCH_ON", 1);
 const SEARCH_QUERIES = (process.env.SEARCH_QUERIES || "pump,pumpswap,raydium,meme,ai,cat,dog,pepe,trump,sol")
   .split(",").map(s => s.trim()).filter(Boolean);
 
@@ -52,12 +61,12 @@ const MC_MAX = num("MC_MAX", 1e7);
 const LIQ_MC_MIN = num("LIQ_MC_MIN", 0.03);
 const TRADES_MIN = num("TRADES_MIN", 20);
 
-// -- pullback entry: after a good signal wait for a dip from the recent high, buy on the bounce --
-const PULLBACK = num("PULLBACK", 1);            // 1 = on (loop modes only), 0 = buy immediately
-const PULL_MIN = num("PULL_MIN", 3);            // % dip below the high that must happen first
-const PULL_MAX = num("PULL_MAX", 12);           // dip deeper than this = trend broken, signal dropped
-const BOUNCE = num("BOUNCE", 1);                // % rise from the low of the dip needed to buy
-const SIGNAL_MIN = num("SIGNAL_MIN", 60);       // signal expires after this many minutes
+// -- pullback entry --
+const PULLBACK = num("PULLBACK", 1);
+const PULL_MIN = num("PULL_MIN", 3);
+const PULL_MAX = num("PULL_MAX", 12);
+const BOUNCE = num("BOUNCE", 1);
+const SIGNAL_MIN = num("SIGNAL_MIN", 60);
 const MAX_SIGNALS = num("MAX_SIGNALS", 20);
 
 // -- exits --
@@ -77,14 +86,14 @@ const PARTIAL_PCT = num("PARTIAL_PCT", 0.5);
 const PARTIAL2_X = num("PARTIAL2_X", 3);
 const PARTIAL2_PCT = num("PARTIAL2_PCT", 0.25);
 const RUG_LIQ = num("RUG_LIQ", 2500);
-const LIQ_DROP = num("LIQ_DROP", 30);           // exit when liquidity falls this % within LIQ_WINDOW_MIN (0 = off)
+const LIQ_DROP = num("LIQ_DROP", 30);
 const LIQ_WINDOW_MIN = num("LIQ_WINDOW_MIN", 10);
 const POLL_SEC = num("POLL_SEC", 20);
 const SNAP_SEC = num("SNAP_SEC", 60);
 const NOPRICE_MIN = num("NOPRICE_MIN", 3);
 const NOPRICE_RECOVERY = num("NOPRICE_RECOVERY", 0.05);
 
-// -- entry momentum confirmation (used before a signal / immediate entry) --
+// -- entry momentum confirmation --
 const MOM_M5_MIN = num("MOM_M5_MIN", 0.3);
 const MOM_M5_MAX = num("MOM_M5_MAX", 25);
 const MOM_MIN_TRADES = num("MOM_MIN_TRADES", 10);
@@ -108,6 +117,10 @@ const BL_LOSS = num("BL_LOSS", 0.40);
 
 // -- simulated costs --
 const FEE = num("FEE", 0.005), SLIP = num("SLIP", 0.015);
+
+// -- 24/7 hardening --
+const HTTP_TIMEOUT_MS = num("HTTP_TIMEOUT_MS", 15000);
+const WATCHDOG_MIN = num("WATCHDOG_MIN", 10);    // no progress for this long = process exits, next scheduled run takes over
 // ========================================================================================
 
 const PARAMS = { STOP, ARM_X, TRAIL_WIDE, TRAIL_LOCK, TRAIL_PCT, TRAIL_TIGHT, TIER_LO_X, TIER_HI_X, LOCK_X, LOCK_FLOOR, FAST_DROP, PARTIAL_X, PARTIAL_PCT, PARTIAL2_X, PARTIAL2_PCT };
@@ -125,20 +138,28 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 let USER = null;
+process.on("unhandledRejection", e => log("unhandled rejection:", String(e?.message || e)));
+
+async function login() {
+  const r = await db.auth.signInWithPassword({ email: BOT_EMAIL, password: BOT_PASSWORD });
+  if (r.error) throw new Error(r.error.message);
+  USER = r.data.user.id;
+  return r.data.user;
+}
 
 async function notify(text) {
   if (!WEBHOOK) return;
   try {
-    await fetch(WEBHOOK, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content: text.slice(0, 1900) }) });
+    await fetch(WEBHOOK, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content: text.slice(0, 1900) }), signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
   } catch (e) { log("notify failed:", e.message); }
 }
 
 async function api(url) {
-  const r = await fetch(url, { headers: { accept: "application/json" } });
+  const r = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(HTTP_TIMEOUT_MS) });
   if (!r.ok) throw new Error(r.status + " " + url);
   return r.json();
 }
-// tick (optional) is called between requests, so open positions keep being checked during long scans
+// tick (optional) runs between requests, so open positions keep being checked during long scans
 async function pairsFor(addrs, tick) {
   const out = [];
   for (let i = 0; i < addrs.length; i += 30) {
@@ -302,7 +323,7 @@ async function rugCheck(mint) {
   return res;
 }
 
-// ---- position size: base % by risk level x scaling (score, win/loss streak) ----
+// ---- position size: base % by risk level x scaling, capped by equity share and token liquidity ----
 function sizeMult(score, cycles) {
   let m = 1;
   if (SCALE_SCORE) m *= clamp(0.7 + (score - 60) / 40 * 0.6, 0.7, 1.3);
@@ -318,6 +339,7 @@ function sizeFor(e, equity, invested, cashLeft, mult) {
   let usd = equity * pct * mult;
   usd = Math.min(usd, equity * MAX_POS_PCT);
   if (MAX_USD > 0) usd = Math.min(usd, MAX_USD);
+  if (MAX_LIQ_PCT > 0) usd = Math.min(usd, (e.p.liquidity?.usd || 0) * MAX_LIQ_PCT);
   usd = Math.min(usd, equity * MAX_EXPOSURE - invested, cashLeft);
   usd = Math.floor(usd * 100) / 100;
   return { usd: usd >= MIN_USD ? usd : 0, pct };
@@ -372,6 +394,14 @@ function positions(S, until) {
 }
 const openOf = pos => Object.entries(pos).filter(([, p]) => p.qty > 1e-8);
 
+// live view of cash / exposure / free slots (invested valued at cost)
+function liveCtx(S, cycles, banned) {
+  const open = openOf(positions(S));
+  const invested = open.reduce((s, [, p]) => s + p.qty * p.entry, 0);
+  const c = cash(S);
+  return { equity: c + invested, invested, cash: c, cycles, banned, freeSlots: MAX_OPEN - open.length };
+}
+
 async function must(q) { const r = await q; if (r.error) throw new Error(r.error.message); return r.data; }
 const now = () => new Date().toISOString();
 
@@ -400,7 +430,7 @@ async function tokenFor(S, p) {
   return S.tokens.find(t => t.mint_address === p.baseToken.address) || addToken(p);
 }
 
-// ---- blacklist, creator blacklist & cooldown (derived from the decision log) ----
+// ---- blacklist, creator blacklist, loss ban, cooldown, pause (all derived from the database) ----
 const isBlacklisted = (S, tokenId) => S.decisions.some(d => d.token_id === tokenId && /BLACKLIST/.test(d.reason || ""));
 function bannedCreators(S) {
   const out = new Set();
@@ -419,6 +449,20 @@ function cooldownLeftMin(S, tokenId) {
   if (!exits.length) return 0;
   const last = exits[0], wait = /stop-loss/i.test(last.reason || "") ? COOLDOWN_STOP_MIN : COOLDOWN_MIN;
   return Math.max(0, wait - (Date.now() - new Date(last.created_at)) / 6e4);
+}
+// token whose LAST closed trade lost money is not bought again for LOSS_BAN_H hours
+function lossBans(cycles) {
+  const m = {};
+  for (const c of cycles.slice().sort((a, b) => a.closedAt - b.closedAt)) m[c.tid] = c.pnl <= 0 ? +c.closedAt : 0;
+  return m;
+}
+const lossBanned = (bans, tid) => LOSS_BAN_H > 0 && !!bans[tid] && Date.now() - bans[tid] < LOSS_BAN_H * 36e5;
+// no new entries for PAUSE_MIN minutes after PAUSE_LOSSES losing trades in a row
+function pauseLeftMin(cycles) {
+  if (PAUSE_LOSSES <= 0 || PAUSE_MIN <= 0) return 0;
+  const last = cycles.slice().sort((a, b) => a.closedAt - b.closedAt).slice(-PAUSE_LOSSES);
+  if (last.length < PAUSE_LOSSES || !last.every(c => c.pnl <= 0)) return 0;
+  return Math.max(0, PAUSE_MIN - (Date.now() - last[last.length - 1].closedAt) / 6e4);
 }
 
 // ---- mark-to-market ----
@@ -465,6 +509,33 @@ function closedCycles(S) {
   }
   return cycles;
 }
+
+// ---- exit-reason statistics: which kind of exit makes / loses the money ----
+function exitCategory(reason) {
+  const r = reason || "";
+  if (/stop-loss/i.test(r)) return "stop-loss";
+  if (/rug pull/i.test(r)) return "rug pull";
+  if (/liquidity dropped/i.test(r)) return "liquidity drop";
+  if (/no price data/i.test(r)) return "dead pair";
+  if (/sudden drop/i.test(r)) return "sudden drop";
+  if (/profit floor/i.test(r)) return "profit floor";
+  if (/trailing stop/i.test(r)) return "trailing stop";
+  if (/time stop/i.test(r)) return "time stop";
+  return "other";
+}
+function exitStats(S, cycles) {
+  const exits = S.decisions.filter(d => d.decision === "WYJŚĆ").sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+  const agg = {};
+  for (const c of cycles) {
+    const d = exits.find(x => x.token_id === c.tid && +new Date(x.created_at) >= +c.closedAt - 3000);
+    const cat = d ? exitCategory(d.reason) : "manual/unknown";
+    const a = agg[cat] || (agg[cat] = { n: 0, wins: 0, pnl: 0, ret: 0 });
+    a.n++; a.pnl += c.pnl; a.ret += c.ret; if (c.pnl > 0) a.wins++;
+  }
+  return Object.entries(agg).sort((a, b) => a[1].pnl - b[1].pnl)
+    .map(([k, a]) => `${k}: ${a.n} trades, wins ${a.wins}, P&L $${a.pnl.toFixed(2)}, avg ${(a.ret / a.n * 100).toFixed(1)}%`);
+}
+
 function stats(S) {
   const cycles = closedCycles(S);
   const line = (name, list) => {
@@ -475,12 +546,14 @@ function stats(S) {
   };
   log("STATS", line("ALL", cycles) || "no closed trades yet");
   for (const lv of ["LOW", "MEDIUM", "HIGH"]) { const ln = line(lv, cycles.filter(c => c.level === lv)); if (ln) log("STATS", ln); }
+  for (const l of exitStats(S, cycles)) log("EXITS", l);
 }
 
 // ---- daily report (UTC day) ----
 async function report(S) {
   const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
-  const today = closedCycles(S).filter(c => c.closedAt >= dayStart);
+  const all = closedCycles(S);
+  const today = all.filter(c => c.closedAt >= dayStart);
   const buys = S.trades.filter(t => t.side === "BUY" && new Date(t.executed_at) >= dayStart).length;
   const wins = today.filter(c => c.pnl > 0);
   const pnl = today.reduce((s, c) => s + c.pnl, 0);
@@ -495,6 +568,8 @@ async function report(S) {
     best ? `best: ${name(best)} $${best.pnl.toFixed(2)} (${(best.ret * 100).toFixed(1)}%) | worst: ${name(worst)} $${worst.pnl.toFixed(2)} (${(worst.ret * 100).toFixed(1)}%)` : "no closed trades today",
     `open positions: ${mtm.count}, unrealized P&L $${(mtm.value - mtm.cost).toFixed(2)}`,
     `equity (mark-to-market): $${equity.toFixed(2)} (cash $${cash(S).toFixed(2)})`,
+    "exit reasons (all time):",
+    ...exitStats(S, all).map(l => "  " + l),
   ];
   lines.forEach(l => log("REPORT", l));
   await notify(lines.join("\n"));
@@ -529,10 +604,12 @@ function exitRule(s, P) {
 async function enter(S, e, ctx, how) {
   const addr = e.p.baseToken.address;
   const known = S.tokens.find(t => t.mint_address === addr);
-  if (known && positions(S)[known.id]?.qty > 1e-8) return { ok: false, rejected: true };   // already held
+  if (known && positions(S)[known.id]?.qty > 1e-8) return { ok: false, rejected: true };
+  if (known && lossBanned(lossBans(ctx.cycles), known.id)) return { ok: false, rejected: true };
+  if (e.level === "HIGH" && !ALLOW_HIGH) return { ok: false, park: `score ${e.score}/100 but risk HIGH is switched off. ${e.note}` };
   const mult = sizeMult(e.score, ctx.cycles);
   const { usd, pct } = sizeFor(e, ctx.equity, ctx.invested, ctx.cash, mult);
-  if (!usd) return { ok: false, park: `score ${e.score}/100 but no cash or exposure room. ${e.note}` };
+  if (!usd) return { ok: false, park: `score ${e.score}/100 but no cash, exposure or liquidity room. ${e.note}` };
   const rc = await rugCheck(addr);
   if (!rc.ok) {
     if (rc.fatal) {
@@ -554,7 +631,7 @@ async function enter(S, e, ctx, how) {
   await snapshot(tok.id, e.p);
   await paperBuy(tok.id, tok.ticker, +e.p.priceUsd, usd, e.p.liquidity?.usd || 0);
   await decide(tok.id, "WEJŚĆ", `score ${e.score}/100, risk ${e.level}, size $${usd.toFixed(2)} (${(usd / ctx.equity * 100).toFixed(1)}% of portfolio, base ${(pct * 100).toFixed(1)}% x${mult.toFixed(2)}). entry: ${how}. rugcheck ${rc.why || "off"}. creator:${rc.creator || "unknown"}. ${e.note}`,
-    `Stop-loss -${Math.round((1 - STOP) * 100)}%; sell ${Math.round(PARTIAL_PCT * 100)}% at ${PARTIAL_X}x and ${Math.round(PARTIAL2_PCT * 100)}% at ${PARTIAL2_X}x; from +${Math.round((LOCK_X - 1) * 100)}% floor ${LOCK_FLOOR}x + sudden-drop exit; trailing ${TRAIL_WIDE}/${TRAIL_LOCK}/${TRAIL_PCT}/${TRAIL_TIGHT}%; liquidity drop ${LIQ_DROP}% in ${LIQ_WINDOW_MIN} min exit`,
+    `Stop-loss -${Math.round((1 - STOP) * 100)}%; sell ${Math.round(PARTIAL_PCT * 100)}% at ${PARTIAL_X}x and ${Math.round(PARTIAL2_PCT * 100)}% at ${PARTIAL2_X}x; from +${Math.round((LOCK_X - 1) * 100)}% floor ${LOCK_FLOOR}x + sudden-drop exit; trailing ${TRAIL_WIDE}/${TRAIL_LOCK}/${TRAIL_PCT}/${TRAIL_TIGHT}%; liquidity drop ${LIQ_DROP}% in ${LIQ_WINDOW_MIN} min; time stop ${TIME_STOP_H}h`,
     `Risk level ${e.level}. Memecoin: can go to zero.`);
   log("ENTER", tok.ticker, "score", e.score, "risk", e.level, "size $" + usd.toFixed(2), "mult", mult.toFixed(2), "|", how);
   await notify(`ENTER ${tok.ticker} $${usd.toFixed(2)} (score ${e.score}, risk ${e.level}, x${mult.toFixed(2)}) ${how}`);
@@ -573,12 +650,15 @@ function addSignal(p) {
 }
 async function checkSignals(S) {
   if (!signals.size) return false;
+  const cycles = closedCycles(S);
+  if (pauseLeftMin(cycles) > 0) return false;
+  const bans = lossBans(cycles);
   const pos = positions(S);
   const open = openOf(pos);
   const best = bestPair(await pairsFor([...signals.keys()]));
-  const banned = bannedCreators(S), cycles = closedCycles(S);
+  const banned = bannedCreators(S);
   let freeSlots = MAX_OPEN - open.length;
-  let c = cash(S), invested = open.reduce((s, [, p]) => s + p.qty * p.entry, 0);   // at cost
+  let c = cash(S), invested = open.reduce((s, [, p]) => s + p.qty * p.entry, 0);
   let changed = false;
   for (const [mint, sg] of [...signals]) {
     if (Date.now() - sg.t0 > SIGNAL_MIN * 60e3) { signals.delete(mint); log("SIGNAL expired", sg.ticker); continue; }
@@ -590,10 +670,10 @@ async function checkSignals(S) {
     if (dd >= PULL_MIN) { sg.reached = true; sg.low = Math.min(sg.low, price); }
     if (!sg.reached) continue;
     if ((sg.high - sg.low) / sg.high * 100 > PULL_MAX) { signals.delete(mint); log("SIGNAL dropped, fell over", PULL_MAX + "%:", sg.ticker); continue; }
-    if (price < sg.low * (1 + BOUNCE / 100) || dd < PULL_MIN / 2) continue;           // no bounce yet (or already back near the high)
+    if (price < sg.low * (1 + BOUNCE / 100) || dd < PULL_MIN / 2) continue;
     if (freeSlots <= 0) continue;
     const tk = S.tokens.find(t => t.mint_address === mint);
-    if (tk && (isBlacklisted(S, tk.id) || pos[tk.id]?.qty > 1e-8 || cooldownLeftMin(S, tk.id) > 0)) { signals.delete(mint); continue; }
+    if (tk && (isBlacklisted(S, tk.id) || lossBanned(bans, tk.id) || pos[tk.id]?.qty > 1e-8 || cooldownLeftMin(S, tk.id) > 0)) { signals.delete(mint); continue; }
     const e = { p, ...evaluate(p) };
     signals.delete(mint);
     if (e.risks.length || e.score < MIN_SCORE - 10) { log("SIGNAL cancelled", sg.ticker, "-", e.risks[0] || `score ${e.score}`); continue; }
@@ -604,12 +684,15 @@ async function checkSignals(S) {
 }
 
 // ---- scan ----
-async function scan(S, tick) {
+async function scan(S, tick, refresh) {
+  const cycles = closedCycles(S);
+  const pl = pauseLeftMin(cycles);
+  if (pl > 0) return log(`ENTRY PAUSE: ${PAUSE_LOSSES} losing trades in a row, ${pl.toFixed(0)} min left, no new entries`);
   const pos = positions(S);
   const known = new Set(S.tokens.map(t => t.mint_address));
   const banned = bannedCreators(S);
-  const cycles = closedCycles(S);
-  const notHeld = t => !(pos[t.id]?.qty > 1e-8) && !isBlacklisted(S, t.id) && cooldownLeftMin(S, t.id) <= 0;
+  const bans = lossBans(cycles);
+  const notHeld = t => !(pos[t.id]?.qty > 1e-8) && !isBlacklisted(S, t.id) && !lossBanned(bans, t.id) && cooldownLeftMin(S, t.id) <= 0;
   const lastDec = {};
   for (const d of S.decisions) { const ts = +new Date(d.created_at); if (!(lastDec[d.token_id] >= ts)) lastDec[d.token_id] = ts; }
   const reentry = S.tokens.filter(t => t.status === "WYJŚĆ" && notHeld(t)).map(t => t.mint_address);
@@ -626,12 +709,7 @@ async function scan(S, tick) {
   for (const e of ev) for (const r of e.risks) why[r] = (why[r] || 0) + 1;
   const top = Object.entries(why).sort((a, b) => b[1] - a[1]).slice(0, 5);
   if (top.length) log("top rejection reasons:", top.map(([r, n]) => `${r} (${n})`).join("; "));
-
-  step = "equity";
-  const mtm = await markToMarket(S);
-  let freeSlots = MAX_OPEN - mtm.count, c = cash(S), invested = mtm.value;
-  const equity = c + invested;
-  log(`equity $${equity.toFixed(2)} (cash $${c.toFixed(2)} + open positions $${invested.toFixed(2)}), open ${mtm.count}`);
+  { const c0 = liveCtx(S, cycles, banned); log(`equity $${c0.equity.toFixed(2)} (cash $${c0.cash.toFixed(2)} + invested at cost $${c0.invested.toFixed(2)}), free slots ${c0.freeSlots}`); }
 
   const handled = new Set();
   const park = async (e, reason, trigger) => {
@@ -648,11 +726,13 @@ async function scan(S, tick) {
     const addr = e.p.baseToken.address;
     const mom = momentum(e.p);
     if (mom) { await park(e, `score ${e.score}/100 but no momentum confirmation: ${mom}. ${e.note}`, "Wait for a 5m uptrend with buyers ahead"); continue; }
-    if (freeSlots <= 0) { await park(e, `score ${e.score}/100 but no free slot. ${e.note}`); continue; }
-    if (pullbackOn) { addSignal(e.p); handled.add(addr); continue; }       // buy later, on the dip
+    if (e.level === "HIGH" && !ALLOW_HIGH) { await park(e, `score ${e.score}/100 but risk HIGH is switched off. ${e.note}`); continue; }
+    const ctx = liveCtx(S, cycles, banned);
+    if (ctx.freeSlots <= 0) { await park(e, `score ${e.score}/100 but no free slot. ${e.note}`); continue; }
+    if (pullbackOn) { addSignal(e.p); handled.add(addr); continue; }
     handled.add(addr);
-    const r = await enter(S, e, { equity, invested, cash: c, cycles, banned }, "immediate (momentum confirmed)");
-    if (r.ok) { freeSlots--; c -= r.usd; invested += r.usd; }
+    const r = await enter(S, e, ctx, "immediate (momentum confirmed)");
+    if (r.ok) await refresh();
     else if (r.park) await park(e, r.park);
   }
   for (const e of ok.filter(e => e.score >= WATCH_MIN && e.score < MIN_SCORE && !handled.has(e.p.baseToken.address))) {
@@ -736,8 +816,15 @@ async function manage(S) {
       await notify(`PARTIAL ${t.ticker}: sold ${Math.round(pt.pct * 100)}% at ${x.toFixed(2)}x`);
     }
     if (rule.exit && p.qty > 1e-8) { await exitAll(rule.exit); continue; }
+
+    const ageH = (Date.now() - p.firstAt) / 36e5;
+    if (TIME_STOP_H > 0 && ageH >= TIME_STOP_H && peakX < ARM_X && p.qty > 1e-8) {
+      await exitAll(`time stop: ${ageH.toFixed(1)}h without reaching +${Math.round((ARM_X - 1) * 100)}%`);
+      continue;
+    }
+
     if (rule.trailPct) log("HOLD", t.ticker, x.toFixed(4) + "x", "peak", peakX.toFixed(4) + "x", `(trail ${rule.trailPct}%${rule.locked ? ", profit locked" : ""})`);
-    else log("HOLD (not armed)", t.ticker, x.toFixed(4) + "x");
+    else log("HOLD (not armed)", t.ticker, x.toFixed(4) + "x", `age ${ageH.toFixed(1)}h`);
   }
   return changed;
 }
@@ -814,15 +901,13 @@ async function backtest() {
 async function main() {
   if (!BOT_EMAIL || !BOT_PASSWORD) throw new Error("secret BOT_EMAIL or BOT_PASSWORD is empty");
   step = "login";
-  const r = await db.auth.signInWithPassword({ email: BOT_EMAIL, password: BOT_PASSWORD });
-  if (r.error) throw new Error(r.error.message);
-  USER = r.data.user.id;
+  await login();
   if (process.argv.includes("--backtest")) { await backtest(); return; }
   const minArg = process.argv.find(a => a.startsWith("--minutes="));
   const minutes = minArg ? +minArg.split("=")[1] : 0;
   const deadline = minutes > 0 ? Date.now() + minutes * 60e3 : Infinity;
-  log("bot v8 started (paper trading only) | mode", ONCE ? "once" : minutes ? minutes + " min loop" : "loop forever",
-    `| pullback ${pullbackOn ? `on (${PULL_MIN}-${PULL_MAX}%, bounce ${BOUNCE}%)` : "off"} | liquidity exit ${LIQ_DROP}%/${LIQ_WINDOW_MIN}min | stop -${Math.round((1 - STOP) * 100)}% | poll ${POLL_SEC}s | scan ${SCAN_SEC}s | gecko ${GECKO ? "on" : "off"} | search ${SEARCH_ON ? "on" : "off"}`);
+  log("bot v9 started (paper trading only) | mode", ONCE ? "once" : minutes ? minutes + " min loop" : "loop forever",
+    `| sizes ${PCT_LOW}/${PCT_MED}/${PCT_HIGH} | loss ban ${LOSS_BAN_H}h | pause ${PAUSE_LOSSES} losses/${PAUSE_MIN}min | time stop ${TIME_STOP_H}h | pullback ${pullbackOn ? "on" : "off"} | liquidity exit ${LIQ_DROP}%/${LIQ_WINDOW_MIN}min | stop -${Math.round((1 - STOP) * 100)}% | poll ${POLL_SEC}s | scan ${SCAN_SEC}s`);
   if (ONCE) {
     step = "load data";
     const S1 = await load();
@@ -831,13 +916,24 @@ async function main() {
     step = "load data (scan)";
     const S2 = await load();
     step = "scan";
-    await scan(S2);
+    await scan(S2, null, async () => { Object.assign(S2, await load()); });
     step = "stats";
     const S3 = await load();
     stats(S3);
     await report(S3);
     log("run finished");
     return;
+  }
+
+  // ---- 24/7 loop ----
+  let beat = Date.now();
+  if (WATCHDOG_MIN > 0) {
+    setInterval(() => {
+      if (Date.now() - beat > WATCHDOG_MIN * 60e3) {
+        console.log("::error::watchdog: no progress for " + WATCHDOG_MIN + " min, exiting so the next scheduled run takes over");
+        process.exit(1);
+      }
+    }, 60e3).unref();
   }
   const today0 = new Date().toISOString().slice(0, 10);
   let S = null, lastLoad = 0, lastScan = 0, lastTick = 0;
@@ -847,30 +943,38 @@ async function main() {
     if (S) Object.assign(S, fresh); else S = fresh;
     lastLoad = Date.now();
   };
-  // called between requests during a scan, so open positions and pullback signals are still watched
+  const onErr = async (label, e) => {
+    log(label, e.message);
+    if (/jwt|expired|401|not authenticated|invalid.*token/i.test(String(e.message))) {
+      try { await login(); log("re-login ok"); } catch (e2) { log("re-login failed:", e2.message); }
+    }
+  };
+  // runs between requests during a scan, so open positions and pullback signals are still watched
   const tick = async () => {
+    beat = Date.now();
     if (!S || Date.now() - lastTick < POLL_SEC * 1000) return;
     lastTick = Date.now();
     try {
       if (await manage(S)) await reload();
       if (await checkSignals(S)) await reload();
-    } catch (e) { log("tick error:", e.message); }
+    } catch (e) { await onErr("tick error:", e); }
   };
   while (Date.now() < deadline) {
     try {
+      beat = Date.now();
       if (!S || Date.now() - lastLoad > 5 * 60e3) await reload();
       lastTick = Date.now();
       if (await manage(S)) await reload();
       if (await checkSignals(S)) await reload();
       if (Date.now() - lastScan > SCAN_SEC * 1000 && Date.now() < deadline - 90e3) {
         await reload();
-        await scan(S, tick); lastScan = Date.now();
+        await scan(S, tick, reload); lastScan = Date.now();
         await reload();
         stats(S);
       }
       const d = new Date(), day = d.toISOString().slice(0, 10);
       if (d.getUTCHours() >= REPORT_HOUR && lastReportDay !== day) { await report(S); lastReportDay = day; }
-    } catch (e) { log("cycle error:", e.message); }
+    } catch (e) { await onErr("cycle error:", e); }
     await sleep(Math.max(0, Math.min(POLL_SEC * 1000, deadline - Date.now())));
   }
   log("time window finished, exiting (open positions stay in the database and are picked up by the next run)");
