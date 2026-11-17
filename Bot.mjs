@@ -1,18 +1,21 @@
-// MemeLab AI — paper trading bot v10 "desk" (NO real money, NO wallet, NO private keys)
-// 6 agents with hard handoffs:
-//   Scout    : DexScreener + GeckoTerminal, pairs 30m-72h old, mcap $300k-$20M
-//   Filter   : liq >= $40k, 1h vol >= $50k, not +80% in 1h  |  RugCheck: mint/freeze revoked, LP burned/locked,
-//              top10 <= 25%, dev <= 3%, bundled/insiders <= 10%, no past rugs
-//   Analyst  : score 0-100 (momentum, buyers, buy/sell ratio, holder growth, liq/mcap, smart wallets), only 70+ pass
-//   Executor : max 8% of equity per trade (paper)
-//   Risk     : stop -6% set at entry, trailing after +12%, partial sells, liquidity-drop / dead-pair / time stop
-//   Logger   : every kill is counted and logged, hard kills are saved in the database
-// Kept from v9: loss re-entry ban, pause after losing streak, creator ban, backtest, daily report, 24/7 hardening.
+// MemeLab AI — paper trading bot v11 "desk + learning" (NO real money, NO wallet, NO private keys)
+// Agents: Scout -> Filter -> Mood -> Learner gate -> RugCheck -> Analyst -> Executor -> Risk -> Logger
+// v11 adds:
+//   * OBSERVATIONS: every coin the bot sees is saved in the database (bot_observations) with its features,
+//     and its price is followed for HORIZON_H hours, also for coins that were REJECTED (so we learn if the filters help)
+//   * LEARNER (every LEARN_SEC): learns from those outcomes (simulated with the bot's own exit rules)
+//       - entry gate: expected return of a coin from its features/hour/source/market mood ("is it worth it / good moment")
+//       - exit tuning: picks better stop/trailing/partial settings, only if they also win on NEWER data
+//       - reports: kill value of every filter, best/worst buckets, by hour, by source, MFE/MAE of real trades
+//   * MARKET MOOD filter: no entries when the scanned market is clearly falling
+//   * MFE/MAE of every real trade is saved
+//   Learning code is wrapped in try/catch: if it fails, trading continues as before.
+// Needs the SQL for bot_observations and bot_learning (see the chat). Without it the bot runs without learning.
 // Run:  npm i @supabase/supabase-js
 //   node Bot.mjs --minutes=345   (loop for N minutes, then exit; GitHub Actions 24/7)
 //   node Bot.mjs                 (loop forever)
 //   node Bot.mjs --once          (one pass)
-//   node Bot.mjs --backtest      (replays saved snapshots with many exit settings)
+//   node Bot.mjs --backtest      (replays saved trade snapshots with many exit settings)
 import { createClient } from "@supabase/supabase-js";
 
 const URL_ = process.env.SUPABASE_URL || "https://wduflmaakgoemxsegnbp.supabase.co";
@@ -28,16 +31,16 @@ const num = (k, d) => (process.env[k] !== undefined && process.env[k] !== "" ? +
 const MAX_TRADE_PCT = num("MAX_TRADE_PCT", 0.08);
 const MIN_TRADE_PCT = num("MIN_TRADE_PCT", 0.04);
 const MAX_EXPOSURE = num("MAX_EXPOSURE", 0.80);
-const MAX_LIQ_PCT = num("MAX_LIQ_PCT", 0.02);   // one position never exceeds this share of token liquidity (0 = off)
+const MAX_LIQ_PCT = num("MAX_LIQ_PCT", 0.02);
 const MIN_USD = num("MIN_USD", 5);
 const MAX_USD = num("MAX_USD", 0);
 const MAX_OPEN = num("MAX_OPEN", 8);
 
 // -- protection against repeating mistakes --
-const LOSS_BAN_H = num("LOSS_BAN_H", 168);      // token closed at a loss is not bought again for this many hours (0 = off)
-const PAUSE_LOSSES = num("PAUSE_LOSSES", 4);    // after this many losing trades in a row...
-const PAUSE_MIN = num("PAUSE_MIN", 30);         // ...no new entries for this many minutes (0 = off)
-const TIME_STOP_H = num("TIME_STOP_H", 3);      // exit a position that never reached the trailing level within this many hours (0 = off)
+const LOSS_BAN_H = num("LOSS_BAN_H", 168);
+const PAUSE_LOSSES = num("PAUSE_LOSSES", 4);
+const PAUSE_MIN = num("PAUSE_MIN", 30);
+const TIME_STOP_H = num("TIME_STOP_H", 3);
 
 // -- SCOUT --
 const SCAN_SEC = num("SCAN_SEC", 300);
@@ -46,34 +49,62 @@ const GECKO = num("GECKO", 1);
 const SEARCH_ON = num("SEARCH_ON", 1);
 const SEARCH_QUERIES = (process.env.SEARCH_QUERIES || "pump,pumpswap,raydium,meme,ai,cat,dog,pepe,trump,sol")
   .split(",").map(s => s.trim()).filter(Boolean);
-const AGE_MIN_H = num("AGE_MIN_H", 0.5);        // 30 min
+const AGE_MIN_H = num("AGE_MIN_H", 0.5);
 const AGE_MAX_H = num("AGE_MAX_H", 72);
 const MC_MIN = num("MC_MIN", 300000);
 const MC_MAX = num("MC_MAX", 20000000);
 
 // -- FILTER (DexScreener data) --
 const LIQ_MIN = num("LIQ_MIN", 40000);
-const VOL1H_MIN = num("VOL1H_MIN", 50000);      // 1 hour volume
-const CH1_MAX = num("CH1_MAX", 80);             // already pumped over this % in 1h = kill
-const CH5_MAX = num("CH5_MAX", 25);             // 5 minute spike over this % = kill
+const VOL1H_MIN = num("VOL1H_MIN", 50000);
+const CH1_MAX = num("CH1_MAX", 80);
+const CH5_MAX = num("CH5_MAX", 25);
 
 // -- FILTER (RugCheck data) --
 const RUGCHECK = num("RUGCHECK", 1);
-const RUGCHECK_STRICT = num("RUGCHECK_STRICT", 1);   // 1 = if RugCheck is unreachable, do NOT enter
-const MAX_RC = num("MAX_RC", 25);               // max fresh RugCheck reports per scan
-const LP_LOCK_MIN = num("LP_LOCK_MIN", 70);     // % of LP that must be burned or locked
-const LP_STRICT = num("LP_STRICT", 0);          // 1 = kill when RugCheck gives no LP data at all
+const RUGCHECK_STRICT = num("RUGCHECK_STRICT", 1);
+const MAX_RC = num("MAX_RC", 25);
+const LP_LOCK_MIN = num("LP_LOCK_MIN", 70);
+const LP_STRICT = num("LP_STRICT", 0);
 const MAX_TOP10 = num("MAX_TOP10", 25);
 const MAX_DEV = num("MAX_DEV", 3);
 const MAX_BUNDLED = num("MAX_BUNDLED", 10);
 const CREATOR_BAN = num("CREATOR_BAN", 1);
-const RC_DEBUG = num("RC_DEBUG", 1);            // print RugCheck field names once, to check the data is read correctly
+const RC_DEBUG = num("RC_DEBUG", 1);
 
 // -- ANALYST --
 const MIN_SCORE = num("MIN_SCORE", 70);
 const WATCH_MIN = num("WATCH_MIN", 55);
-const MOM_M5_MIN = num("MOM_M5_MIN", 0);        // 5m change must be at least this % (analyst veto)
+const MOM_M5_MIN = num("MOM_M5_MIN", 0);
 const SMART = new Set((process.env.SMART_WALLETS || "").split(",").map(s => s.trim()).filter(Boolean));
+
+// -- MARKET MOOD (computed from the coins scanned in each scan) --
+const MOOD_ON = num("MOOD_ON", 1);
+const MOOD_BLOCK_MEDIAN = num("MOOD_BLOCK_MEDIAN", -8);     // block entries when the median 1h change of active coins is below this %
+const MOOD_BLOCK_BREADTH = num("MOOD_BLOCK_BREADTH", 0.25); // ...or when fewer than this share of active coins is up in 1h
+const MOOD_MIN_PAIRS = num("MOOD_MIN_PAIRS", 15);           // mood is only trusted with at least this many active coins
+
+// -- OBSERVATIONS (every coin seen is saved and followed) --
+const OBS_ON = num("OBS_ON", 1);
+const HORIZON_H = num("HORIZON_H", 3);                      // how long the price of each coin is followed
+const FOLLOW_SEC = num("FOLLOW_SEC", 300);                  // price check interval for followed coins
+const PERSIST_SEC = num("PERSIST_SEC", 900);                // how often followed paths are written to the database
+const OBS_DEDUPE_H = num("OBS_DEDUPE_H", 3);                // the same coin is not saved again within this time (unless it got further)
+const OBS_MAX_PER_SCAN = num("OBS_MAX_PER_SCAN", 400);
+const MAX_FOLLOW = num("MAX_FOLLOW", 500);                  // max coins followed at the same time
+const MISSING_N = num("MISSING_N", 3);                      // pair gone for this many checks in a row = dead (-95%)
+
+// -- LEARNER --
+const LEARN_ON = num("LEARN", 1);
+const LEARN_SEC = num("LEARN_SEC", 1800);
+const LEARN_DAYS = num("LEARN_DAYS", 14);
+const LEARN_MIN_OBS = num("LEARN_MIN_OBS", 120);            // resolved coins needed before the entry model is built
+const LEARN_MIN_EXIT = num("LEARN_MIN_EXIT", 100);          // resolved coins needed before exits are tuned
+const LEARN_K = num("LEARN_K", 15);                         // shrinkage: small buckets are pulled towards the average
+const LEARN_MIN_EDGE = num("LEARN_MIN_EDGE", 0);            // learned expected return (fraction) a coin needs, 0 = break-even
+const LEARN_GATE = (process.env.LEARN_GATE || "auto").toLowerCase();   // auto = block when validated | shadow = only log | off
+const LEARN_EXITS = num("LEARN_EXITS", 1);                  // 1 = may adopt better exit settings (validated on newer data)
+const LEARN_EXIT_COOLDOWN_H = num("LEARN_EXIT_COOLDOWN_H", 6);
 
 // -- optional pullback entry (off by default) --
 const PULLBACK = num("PULLBACK", 0);
@@ -84,8 +115,8 @@ const SIGNAL_MIN = num("SIGNAL_MIN", 60);
 const MAX_SIGNALS = num("MAX_SIGNALS", 20);
 
 // -- RISK --
-const STOP = num("STOP", 0.94);                 // stop -6%, fixed at entry
-const ARM_X = num("ARM_X", 1.12);               // trailing starts after +12%
+const STOP = num("STOP", 0.94);
+const ARM_X = num("ARM_X", 1.12);
 const TRAIL_WIDE = num("TRAIL_WIDE", 6);
 const TRAIL_LOCK = num("TRAIL_LOCK", 6);
 const TRAIL_PCT = num("TRAIL_PCT", 5);
@@ -115,7 +146,7 @@ const COOLDOWN_STOP_MIN = num("COOLDOWN_STOP_MIN", 60);
 const BL_LOSS = num("BL_LOSS", 0.40);
 
 // -- LOGGER --
-const VERBOSE = num("LOG_KILLS_VERBOSE", 0);    // 1 = print every single kill, also the cheap ones
+const VERBOSE = num("LOG_KILLS_VERBOSE", 0);
 
 // -- simulated costs --
 const FEE = num("FEE", 0.005), SLIP = num("SLIP", 0.015);
@@ -125,7 +156,10 @@ const HTTP_TIMEOUT_MS = num("HTTP_TIMEOUT_MS", 15000);
 const WATCHDOG_MIN = num("WATCHDOG_MIN", 10);
 // ========================================================================================
 
-const PARAMS = { STOP, ARM_X, TRAIL_WIDE, TRAIL_LOCK, TRAIL_PCT, TRAIL_TIGHT, TIER_LO_X, TIER_HI_X, LOCK_X, LOCK_FLOOR, FAST_DROP, PARTIAL_X, PARTIAL_PCT, PARTIAL2_X, PARTIAL2_PCT };
+// EP = the exit parameters that are really used (start = settings above, the learner may move some of them within BOUNDS)
+const EP = { STOP, ARM_X, TRAIL_WIDE, TRAIL_LOCK, TRAIL_PCT, TRAIL_TIGHT, TIER_LO_X, TIER_HI_X, LOCK_X, LOCK_FLOOR, FAST_DROP, PARTIAL_X, PARTIAL_PCT, PARTIAL2_X, PARTIAL2_PCT };
+const BOUNDS = { STOP: [0.85, 0.97], TRAIL_WIDE: [3, 12], TRAIL_PCT: [3, 8], PARTIAL_X: [1.2, 2.5], FAST_DROP: [2, 8], LOCK_FLOOR: [1.02, 1.12] };
+const GRID = { STOP: [0.88, 0.92, 0.94, 0.96], TRAIL_WIDE: [4, 6, 8], TRAIL_PCT: [4, 5, 7], PARTIAL_X: [1.3, 1.5, 2], FAST_DROP: [3, 4, 6], LOCK_FLOOR: [1.03, 1.06, 1.10] };
 const pullbackOn = !!PULLBACK && !ONCE;
 
 let step = "start";
@@ -140,6 +174,8 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const fmt1 = v => (v === null || v === undefined || !isFinite(v) ? "n/a" : (+v).toFixed(1));
+const pc = v => (v === null || v === undefined || !isFinite(v) ? "n/a" : (v >= 0 ? "+" : "") + (v * 100).toFixed(1) + "%");
+const round = (v, d) => Math.round(v * 10 ** d) / 10 ** d;
 const tickerOf = p => (p.baseToken?.symbol || "?").toUpperCase();
 let USER = null;
 process.on("unhandledRejection", e => log("unhandled rejection:", String(e?.message || e)));
@@ -163,7 +199,7 @@ async function api(url) {
   if (!r.ok) throw new Error(r.status + " " + url);
   return r.json();
 }
-// tick (optional) runs between requests, so open positions keep being checked during long scans
+// tick (optional) runs between requests, so open positions keep being checked during long jobs
 async function pairsFor(addrs, tick) {
   const out = [];
   for (let i = 0; i < addrs.length; i += 30) {
@@ -199,7 +235,7 @@ function killLine(stage, ticker, reason) {
 function killSummary() {
   const by = {};
   for (const [k, n] of Object.entries(killCount)) { const [stage, ...r] = k.split("|"); (by[stage] = by[stage] || []).push([r.join("|"), n]); }
-  for (const stage of ["scout", "filter", "rugcheck", "analyst"]) {
+  for (const stage of ["scout", "filter", "mood", "pause", "learner", "rugcheck", "analyst"]) {
     if (!by[stage]) continue;
     const list = by[stage].sort((a, b) => b[1] - a[1]);
     log("KILLS", stage, `${list.reduce((s, [, n]) => s + n, 0)} total:`, list.slice(0, 6).map(([r, n]) => `${r} (${n})`).join("; "));
@@ -208,7 +244,7 @@ function killSummary() {
 }
 
 // =====================================================================================
-// SCOUT: token sources (DexScreener lists + keyword search + GeckoTerminal pools)
+// SCOUT: token sources (DexScreener lists + keyword search + GeckoTerminal pools), every coin keeps its source tag
 // =====================================================================================
 const STABLE = new Set([
   "So11111111111111111111111111111111111111112",
@@ -216,15 +252,16 @@ const STABLE = new Set([
   "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
 ]);
 const GECKO_URLS = [
-  "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
-  "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2",
-  "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?duration=1h",
-  "https://api.geckoterminal.com/api/v2/networks/solana/pools?page=1&sort=h24_volume_usd_desc",
-  "https://api.geckoterminal.com/api/v2/networks/solana/pools?page=2&sort=h24_volume_usd_desc",
+  ["gecko-new", "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1"],
+  ["gecko-new", "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=2"],
+  ["gecko-trending", "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?duration=1h"],
+  ["gecko-volume", "https://api.geckoterminal.com/api/v2/networks/solana/pools?page=1&sort=h24_volume_usd_desc"],
+  ["gecko-volume", "https://api.geckoterminal.com/api/v2/networks/solana/pools?page=2&sort=h24_volume_usd_desc"],
 ];
+const srcOf = new Map();   // mint -> source tag (first source that found it)
 async function discover(tick) {
   const set = new Set();
-  const add = a => { if (typeof a === "string" && a && !STABLE.has(a)) set.add(a); };
+  const add = (a, tag) => { if (typeof a === "string" && a && !STABLE.has(a)) { set.add(a); if (!srcOf.has(a)) srcOf.set(a, tag); } };
   const run = async (label, fn, gap) => {
     const before = set.size;
     try { await fn(); } catch (e) { log(`discover ${label} failed:`, e.message); }
@@ -232,28 +269,28 @@ async function discover(tick) {
     await sleep(gap);
     if (tick) await tick();
   };
-  const dexLists = ["token-profiles/latest/v1", "token-boosts/latest/v1", "token-boosts/top/v1", "community-takeovers/latest/v1", "ads/latest/v1"];
-  for (const path of dexLists) {
+  const dexLists = [["token-profiles/latest/v1", "dex-profiles"], ["token-boosts/latest/v1", "dex-boosts"], ["token-boosts/top/v1", "dex-top"], ["community-takeovers/latest/v1", "dex-community"], ["ads/latest/v1", "dex-ads"]];
+  for (const [path, tag] of dexLists) {
     await run("dex " + path.split("/")[0], async () => {
       const j = await api("https://api.dexscreener.com/" + path);
-      (Array.isArray(j) ? j : []).forEach(x => x?.chainId === "solana" && add(x.tokenAddress));
+      (Array.isArray(j) ? j : []).forEach(x => x?.chainId === "solana" && add(x.tokenAddress, tag));
     }, 1100);
   }
   if (SEARCH_ON) {
     for (const q of SEARCH_QUERIES) {
       await run("search " + q, async () => {
         const j = await api("https://api.dexscreener.com/latest/dex/search?q=" + encodeURIComponent(q));
-        (j?.pairs || []).forEach(p => p?.chainId === "solana" && add(p.baseToken?.address));
+        (j?.pairs || []).forEach(p => p?.chainId === "solana" && add(p.baseToken?.address, "search"));
       }, 450);
     }
   }
   if (GECKO) {
-    for (const u of GECKO_URLS) {
+    for (const [tag, u] of GECKO_URLS) {
       await run("gecko " + u.split("/").pop().split("?")[0], async () => {
         const j = await api(u);
         (j?.data || []).forEach(d => {
           const id = d?.relationships?.base_token?.data?.id;
-          if (typeof id === "string" && id.startsWith("solana_")) add(id.slice(7));
+          if (typeof id === "string" && id.startsWith("solana_")) add(id.slice(7), tag);
         });
       }, 2200);
     }
@@ -288,14 +325,26 @@ function filterKills(p) {
 }
 
 // =====================================================================================
+// MARKET MOOD: median 1h change and share of rising coins among the active coins of a scan
+// =====================================================================================
+let MOOD = { median: 0, breadth: 0.5, n: 0 };
+function computeMood(pairs) {
+  const act = pairs.filter(p => (p.liquidity?.usd || 0) >= 10000 && ((p.txns?.h1?.buys || 0) + (p.txns?.h1?.sells || 0)) >= 20 && typeof p.priceChange?.h1 === "number");
+  if (!act.length) return { median: 0, breadth: 0.5, n: 0 };
+  const ch = act.map(p => p.priceChange.h1).sort((a, b) => a - b);
+  const med = ch.length % 2 ? ch[(ch.length - 1) / 2] : (ch[ch.length / 2 - 1] + ch[ch.length / 2]) / 2;
+  return { median: med, breadth: ch.filter(v => v > 0).length / ch.length, n: ch.length };
+}
+
+// =====================================================================================
 // FILTER (RugCheck part): mint/freeze, LP, top10, dev, bundled, past rugs
 // =====================================================================================
 const rcCache = new Map();
-const holderHist = new Map();     // mint -> [{t, n}] holder counts seen over time
+const holderHist = new Map();
 let rcDebugged = false;
 const rcFresh = m => { const h = rcCache.get(m); return !!h && Date.now() - h.t < h.ttl; };
 const rcPeek = m => rcCache.get(m)?.res || null;
-function holderGrowth(mint) {     // % growth of the holder count, null when there is not enough history yet
+function holderGrowth(mint) {
   const h = holderHist.get(mint) || [];
   if (h.length < 2) return null;
   const a = h[0], b = h[h.length - 1];
@@ -339,14 +388,12 @@ async function rugCheck(mint) {
     if (prev.some(t => t?.rugged === true || /rug/i.test(String(t?.status || ""))))
       kills.push({ key: "creator has past rugs", detail: "creator has past rugged tokens", hard: true, ban: true });
 
-    // LP burned / locked
     const markets = Array.isArray(j?.markets) ? j.markets : [];
     const lpVals = markets.map(m => m?.lp?.lpLockedPct).filter(v => typeof v === "number" && isFinite(v));
     const lpPct = lpVals.length ? Math.max(...lpVals) : null;
     if (lpPct !== null && lpPct < LP_LOCK_MIN) kills.push({ key: `LP burned/locked under ${LP_LOCK_MIN}%`, detail: `LP burned/locked only ${lpPct.toFixed(0)}%` });
     else if (lpPct === null && LP_STRICT) kills.push({ key: "LP lock data missing", detail: "no LP lock data" });
 
-    // holders (pool accounts are excluded when they can be recognised)
     const pool = new Set();
     collectStrings(markets, pool);
     const th = (Array.isArray(j?.topHolders) ? j.topHolders : []).filter(h => !pool.has(h?.address) && !pool.has(h?.owner));
@@ -363,7 +410,7 @@ async function rugCheck(mint) {
     if (dev === null && creator) {
       const bal = +j?.creatorBalance, sup = +j?.token?.supply;
       if (isFinite(bal) && isFinite(sup) && sup > 0) dev = bal / sup * 100;
-      else if (th.length) dev = 0;                           // creator is not among the biggest holders
+      else if (th.length) dev = 0;
     }
     if (top10 !== null && top10 > MAX_TOP10) kills.push({ key: `top 10 holders over ${MAX_TOP10}%`, detail: `top 10 holders ${top10.toFixed(1)}%` });
     if (dev !== null && dev > MAX_DEV) kills.push({ key: `dev holds over ${MAX_DEV}%`, detail: `dev holds ${dev.toFixed(1)}%` });
@@ -390,8 +437,7 @@ async function rugCheck(mint) {
 }
 
 // =====================================================================================
-// ANALYST: score 0-100. Weights: momentum 25, buyers 15, buy/sell 20, holder growth 15, liq/mcap 15, smart wallets 10 (only if SMART_WALLETS is set)
-// "buyers" = number of buy transactions in 1h (DexScreener has no unique-buyer count)
+// ANALYST: score 0-100. Weights: momentum 25, buyers 15, buy/sell 20, holder growth 15, liq/mcap 15, smart wallets 10
 // =====================================================================================
 function analyst(p, rc) {
   const addr = p.baseToken.address;
@@ -412,7 +458,7 @@ function analyst(p, rc) {
   const r5 = b5 + s5 >= 5 ? b5 / (b5 + s5) : r1;
   parts.ratio = clamp((r1 - 0.45) / 0.2, 0, 1) * 10 + clamp((r5 - 0.45) / 0.2, 0, 1) * 10;
   const g = holderGrowth(addr);
-  parts.holders = g === null ? 7 : clamp(g / 5, 0, 1) * 15;      // no history yet = neutral 7 of 15
+  parts.holders = g === null ? 7 : clamp(g / 5, 0, 1) * 15;
   parts.liqmc = mc > 0 ? clamp((liq / mc - 0.02) / 0.08, 0, 1) * 15 : 0;
   let max = 90;
   if (SMART.size) {
@@ -488,7 +534,6 @@ function positions(S, until) {
 }
 const openOf = pos => Object.entries(pos).filter(([, p]) => p.qty > 1e-8);
 
-// live view of cash / exposure / free slots (invested valued at cost)
 function liveCtx(S, cycles, banned) {
   const open = openOf(positions(S));
   const invested = open.reduce((s, [, p]) => s + p.qty * p.entry, 0);
@@ -628,6 +673,17 @@ function exitStats(S, cycles) {
     .map(([k, a]) => `${k}: ${a.n} trades, wins ${a.wins}, P&L $${a.pnl.toFixed(2)}, avg ${(a.ret / a.n * 100).toFixed(1)}%`);
 }
 
+// ---- real trades by hour of entry (UTC, 4h blocks) ----
+function hourStats(cycles) {
+  const agg = {};
+  for (const c of cycles) {
+    const h = Math.floor(new Date(c.at).getUTCHours() / 4) * 4;
+    const a = agg[h] || (agg[h] = { n: 0, wins: 0, pnl: 0 });
+    a.n++; a.pnl += c.pnl; if (c.pnl > 0) a.wins++;
+  }
+  return Object.keys(agg).map(Number).sort((a, b) => a - b).map(h => `h${h}-${h + 3}: ${agg[h].n} trades, wins ${agg[h].wins}, P&L $${agg[h].pnl.toFixed(2)}`);
+}
+
 function stats(S) {
   const cycles = closedCycles(S);
   const line = (name, list) => {
@@ -639,6 +695,8 @@ function stats(S) {
   log("STATS", line("ALL", cycles) || "no closed trades yet");
   for (const t of ["A", "B"]) { const ln = line("tier " + t, cycles.filter(c => c.level === t)); if (ln) log("STATS", ln); }
   for (const l of exitStats(S, cycles)) log("EXITS", l);
+  const hs = hourStats(cycles);
+  if (hs.length) log("HOURS", hs.join(" | "));
 }
 
 // ---- daily report (UTC day) ----
@@ -667,15 +725,17 @@ async function report(S) {
     `open positions: ${mtm.count}, unrealized P&L $${(mtm.value - mtm.cost).toFixed(2)}`,
     `equity (mark-to-market): $${equity.toFixed(2)} (cash $${cash(S).toFixed(2)})`,
     `hard kills saved today: ${Object.entries(kills).map(([k, n]) => k + " " + n).join(", ") || "none"}`,
+    `market mood now: median 1h ${fmt1(MOOD.median)}%, ${(MOOD.breadth * 100).toFixed(0)}% of ${MOOD.n} active coins up`,
     "exit reasons (all time):",
     ...exitStats(S, all).map(l => "  " + l),
+    ...(LEARN.lines.length ? ["learning:", ...LEARN.lines.slice(0, 12).map(l => "  " + l.slice(0, 260))] : []),
   ];
   lines.forEach(l => log("REPORT", l));
   await notify(lines.join("\n"));
 }
 
 // =====================================================================================
-// RISK: exit rules — one pure function used by the live bot AND by the backtest
+// RISK: exit rules — one pure function used by the live bot, the backtest AND the learner
 // =====================================================================================
 function exitRule(s, P) {
   const { x, peakX, dropNow, soldFrac } = s;
@@ -697,9 +757,331 @@ function exitRule(s, P) {
   }
   return { exit: null, partials, trailPct, locked };
 }
+function simulate(series, entry, P) {
+  const cst = 1 - FEE - SLIP;
+  const q0 = cst; let q = cst, got = 0, peak = entry, prev = entry;
+  for (const pt of series) {
+    const x = pt.price / entry;
+    peak = Math.max(peak, pt.price);
+    const dropNow = prev > 0 ? (prev - pt.price) / prev * 100 : 0;
+    prev = pt.price;
+    const rule = exitRule({ x, peakX: peak / entry, dropNow, soldFrac: (q0 - q) / q0 }, P);
+    for (const w of rule.partials) { const s = Math.min(q, q0 * w.pct); got += s * x * cst; q -= s; }
+    if (rule.exit) { got += q * x * cst; q = 0; break; }
+  }
+  if (q > 1e-9) got += q * (series[series.length - 1].price / entry) * cst;
+  return got - 1;
+}
+function gridCombos(grid) {
+  let combos = [{}];
+  for (const k of Object.keys(grid)) { const next = []; for (const c of combos) for (const v of grid[k]) next.push({ ...c, [k]: v }); combos = next; }
+  return combos;
+}
 
-// ---- EXECUTOR: opens one paper position (stop is defined before the entry) ----
+// =====================================================================================
+// OBSERVATIONS: every coin seen is saved (bot_observations) and its price is followed for HORIZON_H hours
+// stage ranks: a coin is saved again within the dedupe window only if it got further in the pipeline
+// =====================================================================================
+const RANK = { scout: 1, filter: 2, mood: 3, pause: 3, learner: 3, rugcheck: 4, analyst: 5, executor: 6 };
+const POP = new Set(["mood", "pause", "learner", "rugcheck", "analyst"]);   // coins that passed the DexScreener filters
+const OBS = { ok: false, pending: new Map(), seen: new Map(), queue: [] };
+
+function featsOf(p) {
+  const addr = p.baseToken.address;
+  const liq = p.liquidity?.usd || 0, mc = p.marketCap || p.fdv || 0, vol1 = p.volume?.h1 || 0, vol24 = p.volume?.h24 || 0;
+  const age = (Date.now() - (p.pairCreatedAt || Date.now())) / 36e5;
+  const b1 = p.txns?.h1?.buys || 0, s1 = p.txns?.h1?.sells || 0;
+  const ch5 = typeof p.priceChange?.m5 === "number" ? p.priceChange.m5 : null;
+  return {
+    age: round(age, 2), liq: Math.round(liq), mcap: Math.round(mc), vol1h: Math.round(vol1), vol24h: Math.round(vol24),
+    ch5, ch1: p.priceChange?.h1 ?? null, ch6: p.priceChange?.h6 ?? null, b1, s1,
+    bsr1: b1 + s1 ? round(b1 / (b1 + s1), 3) : null, liqmc: mc ? round(liq / mc, 4) : null,
+    mood: MOOD.n ? round(MOOD.median, 1) : null, src: srcOf.get(addr) || "?", hour: new Date().getUTCHours(),
+  };
+}
+function rec(p, stage, verdict, reason, f) {
+  if (!OBS.ok) return;
+  const price = +p.priceUsd;
+  if (!(price > 0)) return;
+  const mint = p.baseToken.address, rank = RANK[stage] || 1;
+  const s = OBS.seen.get(mint);
+  if (s && Date.now() - s.t < OBS_DEDUPE_H * 36e5 && rank <= s.rank) return;
+  OBS.seen.set(mint, { t: Date.now(), rank });
+  const feats = f || featsOf(p);
+  OBS.queue.push({ rank, row: { user_id: USER, mint, ticker: tickerOf(p), source: feats.src, stage, verdict, reason: String(reason).slice(0, 120), price, features: feats, path: [[0, 0]], done: false, stale: false, entered: false } });
+}
+async function obsInit() {
+  if (!OBS_ON) return;
+  const t = await db.from("bot_observations").select("id").limit(1);
+  if (t.error) { log("OBSERVATIONS DISABLED (run the SQL for bot_observations and bot_learning first):", t.error.message); return; }
+  OBS.ok = true;
+  const since = new Date(Date.now() - (HORIZON_H * 60 + 15) * 6e4).toISOString();
+  await db.from("bot_observations").update({ done: true, stale: true }).eq("user_id", USER).eq("done", false).lt("seen_at", since);
+  const pr = await db.from("bot_observations").select("id,mint,seen_at,price,path").eq("user_id", USER).eq("done", false).gte("seen_at", since).order("seen_at", { ascending: false }).limit(MAX_FOLLOW);
+  if (!pr.error) for (const x of pr.data) OBS.pending.set(x.id, { id: x.id, mint: x.mint, price0: +x.price, t0: +new Date(x.seen_at), path: Array.isArray(x.path) && x.path.length ? x.path : [[0, 0]], miss: 0, dirty: false, finish: false, dead: false });
+  const sn = await db.from("bot_observations").select("mint,stage,seen_at").eq("user_id", USER).gte("seen_at", new Date(Date.now() - OBS_DEDUPE_H * 36e5).toISOString()).limit(5000);
+  if (!sn.error) for (const x of sn.data) { const rk = RANK[x.stage] || 1, cur = OBS.seen.get(x.mint); if (!cur || rk > cur.rank) OBS.seen.set(x.mint, { t: +new Date(x.seen_at), rank: rk }); }
+  log(`observations ON: following ${OBS.pending.size} coins, dedupe memory ${OBS.seen.size}`);
+}
+async function obsFlush() {
+  if (!OBS.ok || !OBS.queue.length) return;
+  let q = OBS.queue; OBS.queue = [];
+  q.sort((a, b) => b.rank - a.rank);
+  if (q.length > OBS_MAX_PER_SCAN) q = q.slice(0, OBS_MAX_PER_SCAN);
+  let room = Math.max(0, MAX_FOLLOW - OBS.pending.size);
+  for (const it of q) {                                         // coins beyond the follow limit are still saved, but not followed
+    if (room > 0) room--; else { it.row.done = true; it.row.stale = true; }
+  }
+  let saved = 0;
+  for (let i = 0; i < q.length; i += 100) {
+    const chunk = q.slice(i, i + 100).map(x => x.row);
+    const r = await db.from("bot_observations").insert(chunk).select("id,mint,price,done");
+    if (r.error) { log("obs insert failed:", r.error.message); continue; }
+    saved += r.data.length;
+    for (const row of r.data) if (!row.done) OBS.pending.set(row.id, { id: row.id, mint: row.mint, price0: +row.price, t0: Date.now(), path: [[0, 0]], miss: 0, dirty: false, finish: false, dead: false });
+  }
+  const cut = Date.now() - OBS_DEDUPE_H * 36e5;
+  for (const [k, v] of OBS.seen) if (v.t < cut) OBS.seen.delete(k);
+  log(`observations: saved ${saved} coins, following ${OBS.pending.size}`);
+}
+async function obsEntered(p, f, usd) {
+  if (!OBS.ok) return;
+  try {
+    const feats = { ...(f || featsOf(p)), usd: round(usd, 2) };
+    await must(db.from("bot_observations").insert({ user_id: USER, mint: p.baseToken.address, ticker: tickerOf(p), source: feats.src, stage: "executor", verdict: "entered", reason: "entered", price: +p.priceUsd, features: feats, path: [[0, 0]], done: true, stale: false, entered: true }));
+  } catch (e) { log("obs entered failed:", e.message); }
+}
+async function obsTradeClosed(mint, o) {
+  if (!OBS.ok) return;
+  try {
+    const r = await db.from("bot_observations").select("id").eq("user_id", USER).eq("mint", mint).eq("entered", true).is("closed_at", null).order("seen_at", { ascending: false }).limit(1);
+    const id = r.data?.[0]?.id;
+    if (!id) return;
+    await must(db.from("bot_observations").update({ trade_ret: o.ret, mfe: o.mfe, mae: o.mae, exit_reason: String(o.why).slice(0, 80), closed_at: now() }).eq("id", id));
+  } catch (e) { log("obs trade update failed:", e.message); }
+}
+const nearest = (path, min) => { let b = null, d = 1e9; for (const [m, r] of path) { const x = Math.abs(m - min); if (x < d) { d = x; b = r; } } return d <= 15 ? b : null; };
+async function obsPersist(force) {
+  if (!OBS.ok) return;
+  const list = [...OBS.pending.values()];
+  const fin = list.filter(o => o.finish), dirty = list.filter(o => !o.finish && force && o.dirty);
+  for (let i = 0; i < fin.length; i += 100) {
+    const part = fin.slice(i, i + 100);
+    const rows = part.map(o => {
+      const rets = o.path.map(q => q[1]);
+      return { id: o.id, user_id: USER, mint: o.mint, path: o.path, done: true, resolved_at: now(), ret_1h: nearest(o.path, 60), ret_3h: nearest(o.path, 180), max_up: Math.max(...rets), max_dd: Math.min(...rets) };
+    });
+    const r = await db.from("bot_observations").upsert(rows, { onConflict: "id" });
+    if (r.error) { log("obs persist failed:", r.error.message); break; }
+    for (const o of part) OBS.pending.delete(o.id);
+  }
+  for (let i = 0; i < dirty.length; i += 100) {
+    const part = dirty.slice(i, i + 100);
+    const r = await db.from("bot_observations").upsert(part.map(o => ({ id: o.id, user_id: USER, mint: o.mint, path: o.path })), { onConflict: "id" });
+    if (r.error) { log("obs persist failed:", r.error.message); break; }
+    for (const o of part) o.dirty = false;
+  }
+}
+async function obsFollow(tick) {
+  if (!OBS.ok || !OBS.pending.size) return;
+  const list = [...OBS.pending.values()];
+  const best = bestPair(await pairsFor([...new Set(list.map(o => o.mint))], tick));
+  const t = Date.now();
+  let dead = 0, done = 0;
+  for (const o of list) {
+    const ageMin = (t - o.t0) / 6e4;
+    const pr = best[o.mint];
+    if (pr && +pr.priceUsd > 0) {
+      o.miss = 0;
+      o.path.push([round(ageMin, 1), round((+pr.priceUsd / o.price0 - 1) * 100, 2)]);
+      o.dirty = true;
+    } else {
+      o.miss++;
+      if (o.miss >= MISSING_N) { o.path.push([round(ageMin, 1), -95]); o.dead = true; o.dirty = true; dead++; }
+    }
+    if (o.dead || ageMin >= HORIZON_H * 60) { o.finish = true; done++; }
+  }
+  await obsPersist(false);
+  log(`observations: checked ${list.length} followed coins, finished ${done} (dead ${dead}), still following ${OBS.pending.size}`);
+}
+
+// =====================================================================================
+// LEARNER: learns from the resolved observations (what each coin would have earned with the bot's exit rules)
+// =====================================================================================
+const LEARN = { pop: [], ids: new Set(), last: null, model: null, gate: { active: false }, exitAt: 0, lines: [] };
+const FEATS = ["age", "liq", "mcap", "vol1h", "ch5", "ch1", "bsr1", "liqmc", "hour", "src", "mood"];
+const EDGES = {
+  age: [1, 2, 6, 24, 48], liq: [20000, 40000, 80000, 200000, 500000], mcap: [300000, 1000000, 3000000, 10000000],
+  vol1h: [20000, 50000, 150000, 500000], ch5: [-2, 0, 1, 3, 8], ch1: [-5, 0, 10, 30, 80],
+  bsr1: [0.45, 0.5, 0.55, 0.6], liqmc: [0.03, 0.06, 0.1, 0.2], mood: [-8, -3, 0, 3],
+};
+const kfmt = v => (Math.abs(v) >= 1e6 ? v / 1e6 + "M" : Math.abs(v) >= 1e3 ? v / 1e3 + "k" : String(v));
+function bkt(name, f) {
+  if (name === "hour") { const h = Math.floor((f.hour ?? 0) / 4) * 4; return `hour ${h}-${h + 3}`; }
+  if (name === "src") return "src " + (f.src || "?");
+  const v = f[name];
+  if (v === null || v === undefined || !isFinite(v)) return name + " n/a";
+  const e = EDGES[name]; let i = 0;
+  while (i < e.length && v >= e[i]) i++;
+  return name + " " + (i === 0 ? "<" + kfmt(e[0]) : i === e.length ? ">=" + kfmt(e[e.length - 1]) : kfmt(e[i - 1]) + ".." + kfmt(e[i]));
+}
+const simRet = (o, P) => simulate(o.series, 1, P);
+
+function trainRows(rows, K) {                       // rows: [{f, r}]
+  const mAll = rows.reduce((s, o) => s + o.r, 0) / rows.length;
+  const tab = {};
+  for (const ft of FEATS) {
+    const agg = {};
+    for (const o of rows) { const b = bkt(ft, o.f); const a = agg[b] || (agg[b] = { n: 0, s: 0, w: 0 }); a.n++; a.s += o.r; if (o.r > 0) a.w++; }
+    tab[ft] = {};
+    for (const [b, a] of Object.entries(agg)) tab[ft][b] = { n: a.n, m: (a.s + K * mAll) / (a.n + K), raw: a.s / a.n, w: a.w / a.n };
+  }
+  return { mAll, n: rows.length, tab };
+}
+function edgeOf(model, f) {
+  let s = 0;
+  for (const ft of FEATS) { const e = model.tab[ft]?.[bkt(ft, f)]; s += e ? e.m : model.mAll; }
+  return s / FEATS.length;
+}
+function validateGate(rows, K, T) {                 // train on the older 70%, test on the newest 30%
+  rows = rows.slice().sort((a, b) => a.t - b.t);
+  const cut = Math.floor(rows.length * 0.7), train = rows.slice(0, cut), test = rows.slice(cut);
+  const mean = a => (a.length ? a.reduce((s, o) => s + o.r, 0) / a.length : null);
+  if (train.length < 60 || test.length < 25) return { ok: false, why: "not enough data", accN: 0, testN: test.length, accMean: null, rejMean: null, allMean: mean(test) };
+  const m = trainRows(train, K);
+  const acc = test.filter(o => edgeOf(m, o.f) >= T), rej = test.filter(o => edgeOf(m, o.f) < T);
+  const accMean = mean(acc), rejMean = mean(rej), allMean = mean(test);
+  const ok = acc.length >= 15 && accMean !== null && accMean > allMean + 0.002 && (rejMean === null || accMean > rejMean);
+  return { ok, accN: acc.length, rejN: rej.length, testN: test.length, accMean, rejMean, allMean };
+}
+
+const lsGet = async key => {
+  const r = await db.from("bot_learning").select("value").eq("user_id", USER).eq("key", key).maybeSingle();
+  if (r.error) throw new Error("bot_learning: " + r.error.message);
+  return r.data?.value ?? null;
+};
+const lsSet = async (key, value) => must(db.from("bot_learning").upsert({ user_id: USER, key, value, updated_at: now() }, { onConflict: "user_id,key" }));
+function applyExitParams(o) {
+  for (const k of Object.keys(BOUNDS)) if (typeof o[k] === "number" && o[k] >= BOUNDS[k][0] && o[k] <= BOUNDS[k][1]) EP[k] = o[k];
+}
+async function learnInit() {
+  if (!LEARN_ON || !OBS.ok) return;
+  try {
+    const ex = await lsGet("exit_params");
+    if (ex?.params) { applyExitParams(ex.params); LEARN.exitAt = ex.at ? +new Date(ex.at) : 0; log("LEARN loaded exit params:", Object.keys(BOUNDS).map(k => k + "=" + EP[k]).join(" ")); }
+    const md = await lsGet("model");
+    if (md?.model?.tab) {
+      LEARN.model = md.model; LEARN.gate = md.gate || { active: false };
+      if (LEARN_GATE !== "auto") LEARN.gate.active = false;
+      log(`LEARN loaded entry model (${md.model.n} coins), gate ${LEARN.gate.active ? "ACTIVE" : "inactive"}`);
+    }
+  } catch (e) { log("learn init failed:", e.message); }
+}
+async function learnLoad() {
+  const since = LEARN.last ? new Date(+new Date(LEARN.last) - 5000).toISOString() : new Date(Date.now() - LEARN_DAYS * 864e5).toISOString();
+  let maxR = LEARN.last;
+  for (let from = 0; ; from += 1000) {
+    const r = await db.from("bot_observations").select("id,seen_at,stage,verdict,reason,features,path,resolved_at")
+      .eq("user_id", USER).eq("done", true).eq("stale", false).eq("entered", false).gte("resolved_at", since)
+      .order("resolved_at", { ascending: true }).range(from, from + 999);
+    if (r.error) throw new Error("bot_observations: " + r.error.message);
+    for (const x of r.data) {
+      if (LEARN.ids.has(x.id)) continue;
+      LEARN.ids.add(x.id);
+      const path = Array.isArray(x.path) ? x.path : [];
+      if (path.length >= 2) LEARN.pop.push({ id: x.id, t: +new Date(x.seen_at), f: x.features || {}, stage: x.stage, reason: x.reason, series: path.slice(1).map(q => ({ price: Math.max(0.0001, 1 + (+q[1]) / 100) })) });
+      if (!maxR || x.resolved_at > maxR) maxR = x.resolved_at;
+    }
+    if (r.data.length < 1000) break;
+  }
+  LEARN.last = maxR;
+  const cutoff = Date.now() - LEARN_DAYS * 864e5;
+  LEARN.pop = LEARN.pop.filter(o => o.t >= cutoff).sort((a, b) => a.t - b.t).slice(-6000);
+}
+async function tuneExits(pop, tick) {
+  const rows = pop.slice(-1000);
+  const cut = Math.floor(rows.length * 0.7), tr = rows.slice(0, cut), te = rows.slice(cut);
+  const avg = (list, P) => list.reduce((s, o) => s + simRet(o, P), 0) / list.length;
+  const curTr = avg(tr, EP), curTe = avg(te, EP);
+  let best = null, bestTr = -Infinity, i = 0;
+  for (const c of gridCombos(GRID)) {
+    const a = avg(tr, { ...EP, ...c });
+    if (a > bestTr) { bestTr = a; best = c; }
+    if (++i % 60 === 0) { await sleep(0); if (tick) await tick(); }
+  }
+  const bestTe = avg(te, { ...EP, ...best });
+  const diff = Object.keys(best).filter(k => Math.abs(best[k] - EP[k]) > 1e-9);
+  const sum = `exits: current train ${pc(curTr)} / test ${pc(curTe)} | best train ${pc(bestTr)} / test ${pc(bestTe)} (${diff.map(k => k + "=" + best[k]).join(" ") || "same as current"})`;
+  const cooled = Date.now() - LEARN.exitAt >= LEARN_EXIT_COOLDOWN_H * 36e5;
+  if (diff.length && bestTr > curTr && bestTe > curTe + 0.003 && te.length >= 25 && cooled) {
+    Object.assign(EP, best);
+    LEARN.exitAt = Date.now();
+    await lsSet("exit_params", { params: Object.fromEntries(Object.keys(BOUNDS).map(k => [k, EP[k]])), at: now(), n: rows.length, trainAvg: bestTr, testAvg: bestTe });
+    return sum + " -> ADOPTED";
+  }
+  return sum + (diff.length ? (cooled ? " -> not adopted (no clear gain on newer data)" : " -> cooldown") : "");
+}
+function groupStats(items, keyFn, minN) {
+  const g = {};
+  for (const o of items) { const k = keyFn(o); const a = g[k] || (g[k] = { n: 0, s: 0, w: 0 }); const r = simRet(o, EP); a.n++; a.s += r; if (r > 0) a.w++; }
+  return Object.entries(g).filter(([, a]) => a.n >= minN).map(([k, a]) => ({ k, n: a.n, avg: a.s / a.n, win: a.w / a.n }));
+}
+async function tradeStats() {
+  const r = await db.from("bot_observations").select("trade_ret,mfe,mae").eq("user_id", USER).eq("entered", true).not("trade_ret", "is", null).order("seen_at", { ascending: false }).limit(500);
+  if (r.error || !r.data || r.data.length < 5) return null;
+  const rows = r.data, w = rows.filter(x => x.trade_ret > 0), l = rows.filter(x => x.trade_ret <= 0);
+  const avgOf = (a, k) => (a.length ? a.reduce((s, x) => s + (+x[k] || 0), 0) / a.length : null);
+  const armPct = (ARM_X - 1) * 100;
+  const lMfe = l.filter(x => x.mfe >= armPct).length;
+  return `real trades (${rows.length}): losers avg best point ${fmt1(avgOf(l, "mfe"))}% (${l.length ? Math.round(lMfe / l.length * 100) : 0}% of losers had been above +${armPct.toFixed(0)}% first), winners avg worst dip ${fmt1(avgOf(w, "mae"))}%`;
+}
+async function learnCycle(tick) {
+  if (!LEARN_ON || !OBS.ok) return;
+  step = "learn";
+  await learnLoad();
+  const pop = LEARN.pop.filter(o => POP.has(o.stage));
+  const lines = [`data: ${LEARN.pop.length} resolved coins (${pop.length} passed the DexScreener filters), still following ${OBS.pending.size}`];
+
+  if (LEARN_EXITS && pop.length >= LEARN_MIN_EXIT) lines.push(await tuneExits(pop, tick));
+  else lines.push(`exits: collecting data (${pop.length}/${LEARN_MIN_EXIT})${LEARN_EXITS ? "" : ", tuning switched off"}`);
+
+  if (pop.length >= LEARN_MIN_OBS) {
+    const rows = pop.map(o => ({ t: o.t, f: o.f, r: simRet(o, EP) }));
+    const val = validateGate(rows, LEARN_K, LEARN_MIN_EDGE);
+    LEARN.model = trainRows(rows, LEARN_K);
+    LEARN.gate = { active: LEARN_GATE === "auto" && val.ok, val, at: now() };
+    await lsSet("model", { model: LEARN.model, gate: LEARN.gate });
+    lines.push(`entry gate: ${LEARN.gate.active ? "ACTIVE" : LEARN_GATE === "auto" ? "inactive (not validated yet)" : LEARN_GATE} | test: accepted ${val.accN ?? 0} of ${val.testN ?? 0}, avg ${pc(val.accMean)} vs all ${pc(val.allMean)}${val.why ? " (" + val.why + ")" : ""} | avg simulated trade of all ${pc(LEARN.model.mAll)}`);
+    const all = [];
+    for (const ft of FEATS) if (ft !== "hour" && ft !== "src") for (const [b, e] of Object.entries(LEARN.model.tab[ft])) if (e.n >= 15) all.push({ b, ...e });
+    all.sort((a, b) => b.raw - a.raw);
+    const fmtB = e => `${e.b} n=${e.n} avg ${pc(e.raw)} win ${(e.w * 100).toFixed(0)}%`;
+    if (all.length >= 6) {
+      lines.push("best buckets: " + all.slice(0, 3).map(fmtB).join(" | "));
+      lines.push("worst buckets: " + all.slice(-3).reverse().map(fmtB).join(" | "));
+    }
+    for (const [ft, label] of [["hour", "by hour (UTC)"], ["src", "by source"]]) {
+      const e = Object.entries(LEARN.model.tab[ft]).filter(([, v]) => v.n >= 10).sort((a, b) => b[1].raw - a[1].raw);
+      if (e.length) lines.push(`${label}: ` + e.map(([b, v]) => `${b.replace(/^(hour|src) /, "")} n=${v.n} ${pc(v.raw)}`).join(" | "));
+    }
+  } else lines.push(`entry model: collecting data (${pop.length}/${LEARN_MIN_OBS})`);
+
+  const kv = groupStats(LEARN.pop, o => o.stage + ": " + o.reason, 12).sort((a, b) => b.avg - a.avg);
+  if (kv.length) {
+    const f = e => `${e.k} n=${e.n} avg ${pc(e.avg)} win ${(e.win * 100).toFixed(0)}%`;
+    lines.push("filters that kill profitable coins (avg > 0 = filter costs money): " + kv.slice(0, 3).map(f).join(" | "));
+    lines.push("filters that protect (avg < 0 = filter helps): " + kv.slice(-3).reverse().map(f).join(" | "));
+  }
+  try { const ts = await tradeStats(); if (ts) lines.push(ts); } catch { /* optional */ }
+
+  LEARN.lines = lines;
+  lines.forEach(l => log("LEARN", l));
+}
+
+// =====================================================================================
+// EXECUTOR: opens one paper position (the stop is defined before the entry)
 // returns { ok:true, usd } | { ok:false, park:"reason" } | { ok:false }
+// =====================================================================================
 async function enter(S, e, ctx, how) {
   const addr = e.p.baseToken.address;
   const known = S.tokens.find(t => t.mint_address === addr);
@@ -712,10 +1094,11 @@ async function enter(S, e, ctx, how) {
   await snapshot(tok.id, e.p);
   await paperBuy(tok.id, tok.ticker, price, usd, e.p.liquidity?.usd || 0);
   await decide(tok.id, "WEJŚĆ",
-    `score ${e.score}/100, tier ${e.tier}, size $${usd.toFixed(2)} (${(usd / ctx.equity * 100).toFixed(1)}% of portfolio, base ${(pct * 100).toFixed(1)}%). entry: ${how}. stop set before entry at $${(price * STOP).toPrecision(5)} (-${Math.round((1 - STOP) * 100)}%). rugcheck: ${e.rc?.note || "n/a"}. creator:${e.rc?.creator || "unknown"}. ${e.note}`,
-    `Stop -${Math.round((1 - STOP) * 100)}%; trailing after +${Math.round((ARM_X - 1) * 100)}% (${TRAIL_WIDE}/${TRAIL_LOCK}/${TRAIL_PCT}/${TRAIL_TIGHT}%); sell ${Math.round(PARTIAL_PCT * 100)}% at ${PARTIAL_X}x and ${Math.round(PARTIAL2_PCT * 100)}% at ${PARTIAL2_X}x; floor ${LOCK_FLOOR}x from +${Math.round((LOCK_X - 1) * 100)}%; liquidity drop ${LIQ_DROP}%/${LIQ_WINDOW_MIN}min; time stop ${TIME_STOP_H}h`,
+    `score ${e.score}/100, tier ${e.tier}, size $${usd.toFixed(2)} (${(usd / ctx.equity * 100).toFixed(1)}% of portfolio, base ${(pct * 100).toFixed(1)}%). entry: ${how}. stop set before entry at $${(price * EP.STOP).toPrecision(5)} (-${Math.round((1 - EP.STOP) * 100)}%). learned edge ${e.edge === null || e.edge === undefined ? "n/a" : pc(e.edge)}, mood ${fmt1(MOOD.median)}%. rugcheck: ${e.rc?.note || "n/a"}. creator:${e.rc?.creator || "unknown"}. ${e.note}`,
+    `Stop -${Math.round((1 - EP.STOP) * 100)}%; trailing after +${Math.round((EP.ARM_X - 1) * 100)}% (${EP.TRAIL_WIDE}/${EP.TRAIL_LOCK}/${EP.TRAIL_PCT}/${EP.TRAIL_TIGHT}%); sell ${Math.round(EP.PARTIAL_PCT * 100)}% at ${EP.PARTIAL_X}x and ${Math.round(EP.PARTIAL2_PCT * 100)}% at ${EP.PARTIAL2_X}x; floor ${EP.LOCK_FLOOR}x from +${Math.round((EP.LOCK_X - 1) * 100)}%; liquidity drop ${LIQ_DROP}%/${LIQ_WINDOW_MIN}min; time stop ${TIME_STOP_H}h`,
     `Tier ${e.tier}. Memecoin: can go to zero.`);
-  log("ENTER", tok.ticker, "score", e.score, "tier", e.tier, "size $" + usd.toFixed(2), "|", how);
+  await obsEntered(e.p, e.f, usd);
+  log("ENTER", tok.ticker, "score", e.score, "tier", e.tier, "size $" + usd.toFixed(2), "edge", e.edge === null || e.edge === undefined ? "n/a" : pc(e.edge), "|", how);
   await notify(`ENTER ${tok.ticker} $${usd.toFixed(2)} (score ${e.score}, tier ${e.tier}) ${how}`);
   return { ok: true, usd };
 }
@@ -758,19 +1141,21 @@ async function checkSignals(S) {
     const bad = [...scoutKills(p), ...filterKills(p)];
     const a = analyst(p, rc);
     if (bad.length || a.veto.length || a.score < MIN_SCORE - 10) { log("SIGNAL cancelled", sg.ticker, "-", bad[0] || a.veto[0] || `score ${a.score}`); continue; }
-    const r = await enter(S, { p, rc, ...a }, ctx, `pullback ${dd.toFixed(1)}% below the high, bounce from the low`);
+    const r = await enter(S, { p, rc, ...a, f: featsOf(p), edge: null }, ctx, `pullback ${dd.toFixed(1)}% below the high, bounce from the low`);
     if (r.ok) changed = true;
   }
   return changed;
 }
 
 // =====================================================================================
-// SCAN: Scout -> Filter -> Analyst -> Executor (hard handoffs)
+// SCAN: Scout -> Filter -> Mood -> Learner gate -> RugCheck -> Analyst -> Executor
+// Every coin that is seen is recorded (rec) with the stage that stopped it.
 // =====================================================================================
 async function scan(S, tick, refresh) {
   const cycles = closedCycles(S);
   const pl = pauseLeftMin(cycles);
-  if (pl > 0) return log(`ENTRY PAUSE: ${PAUSE_LOSSES} losing trades in a row, ${pl.toFixed(0)} min left, no new entries`);
+  const canTrade = pl <= 0;
+  if (!canTrade) log(`ENTRY PAUSE: ${PAUSE_LOSSES} losing trades in a row, ${pl.toFixed(0)} min left, no new entries (coins are still recorded)`);
   const pos = positions(S);
   const known = new Set(S.tokens.map(t => t.mint_address));
   const banned = bannedCreators(S);
@@ -783,15 +1168,27 @@ async function scan(S, tick, refresh) {
 
   // ---- 1) SCOUT ----
   step = "scout";
+  srcOf.clear();
   const found = (await discover(tick)).filter(a => !known.has(a));
+  for (const a of reentry) if (!srcOf.has(a)) srcOf.set(a, "reentry");
+  for (const a of watch) if (!srcOf.has(a)) srcOf.set(a, "watch");
   const addrs = [...new Set([...reentry, ...watch, ...found])].slice(0, MAX_CAND);
   log(`scan: ${addrs.length} candidates (${found.length} new, ${reentry.length} re-entry, ${watch.length} waiting), banned creators ${banned.size}, signals ${signals.size}`);
   step = "fetch pair data";
   const pairs = Object.values(bestPair(await pairsFor(addrs, tick)));
+
+  // ---- market mood ----
+  MOOD = computeMood(pairs);
+  const moodBlock = !!MOOD_ON && MOOD.n >= MOOD_MIN_PAIRS && (MOOD.median < MOOD_BLOCK_MEDIAN || MOOD.breadth < MOOD_BLOCK_BREADTH);
+  log(`MOOD: median 1h ${fmt1(MOOD.median)}%, ${(MOOD.breadth * 100).toFixed(0)}% of ${MOOD.n} active coins up -> ${MOOD_ON ? (moodBlock ? "BLOCK entries" : "OK") : "off"}`);
+
+  const fcache = new Map();
+  const F = p => { const k = p.baseToken.address; let f = fcache.get(k); if (!f) { f = featsOf(p); fcache.set(k, f); } return f; };
+
   const scouted = [];
   for (const p of pairs) {
     const r = scoutKills(p);
-    if (r.length) r.forEach(x => { tally("scout", x); if (VERBOSE) killLine("scout", tickerOf(p), x); });
+    if (r.length) { r.forEach(x => { tally("scout", x); if (VERBOSE) killLine("scout", tickerOf(p), x); }); rec(p, "scout", "killed", r[0], F(p)); }
     else scouted.push(p);
   }
 
@@ -799,11 +1196,29 @@ async function scan(S, tick, refresh) {
   const filtered = [];
   for (const p of scouted) {
     const r = filterKills(p);
-    if (r.length) r.forEach(x => { tally("filter", x); if (VERBOSE) killLine("filter", tickerOf(p), x); });
+    if (r.length) { r.forEach(x => { tally("filter", x); if (VERBOSE) killLine("filter", tickerOf(p), x); }); rec(p, "filter", "killed", r[0], F(p)); }
     else filtered.push(p);
   }
   log(`desk: ${pairs.length} pairs -> scout ${scouted.length} -> filter ${filtered.length}`);
   filtered.sort((a, b) => (b.volume?.h1 || 0) - (a.volume?.h1 || 0));
+
+  // ---- 3) MOOD + PAUSE + LEARNER GATE ----
+  const gateActive = LEARN_GATE === "auto" && !!LEARN.model && !!LEARN.gate?.active;
+  let shadowRej = 0, gated = 0;
+  const toRug = [];
+  for (const p of filtered) {
+    const f = F(p);
+    if (moodBlock) { tally("mood", "market mood blocked"); rec(p, "mood", "killed", "market mood blocked", f); continue; }
+    if (!canTrade) { tally("pause", "entry pause after losing streak"); rec(p, "pause", "killed", "entry pause after losing streak", f); continue; }
+    const edge = LEARN.model ? edgeOf(LEARN.model, f) : null;
+    f.edge = edge === null ? null : round(edge, 4);
+    if (edge !== null && edge < LEARN_MIN_EDGE) {
+      if (gateActive) { gated++; tally("learner", "learned edge below threshold"); rec(p, "learner", "killed", "learned edge below threshold", f); continue; }
+      shadowRej++;
+    }
+    toRug.push({ p, f, edge });
+  }
+  if (LEARN.model) log(`LEARN gate: ${gateActive ? "ACTIVE, blocked " + gated : "not blocking, would have blocked " + shadowRej} of ${filtered.length} filtered coins`);
 
   const handled = new Set();
   const park = async (e, reason) => {
@@ -815,23 +1230,24 @@ async function scan(S, tick, refresh) {
     log("WAIT", tok.ticker, "-", reason.slice(0, 90));
   };
 
-  // ---- 3) FILTER (RugCheck) + 4) ANALYST ----
+  // ---- 4) FILTER (RugCheck) + 5) ANALYST ----
   step = "filter + analyst";
   let fetched = 0;
   const passed = [];
-  for (const p of filtered) {
+  for (const { p, f, edge } of toRug) {
     const addr = p.baseToken.address, tk = tickerOf(p);
     const fresh = rcFresh(addr);
-    if (!fresh && RUGCHECK && fetched >= MAX_RC) { tally("rugcheck", "skipped (RugCheck budget per scan)"); continue; }
+    if (!fresh && RUGCHECK && fetched >= MAX_RC) { tally("rugcheck", "skipped (RugCheck budget per scan)"); rec(p, "rugcheck", "killed", "skipped (RugCheck budget per scan)", f); continue; }
     const rc = await rugCheck(addr);
     if (!fresh && RUGCHECK) { fetched++; if (tick) await tick(); }
-    if (rc.unavailable && RUGCHECK_STRICT) { tally("rugcheck", "RugCheck unavailable"); killLine("rugcheck", tk, rc.why); continue; }
+    if (rc.unavailable && RUGCHECK_STRICT) { tally("rugcheck", "RugCheck unavailable"); killLine("rugcheck", tk, rc.why); rec(p, "rugcheck", "killed", "RugCheck unavailable", f); continue; }
     const kills = rc.unavailable ? [] : rc.kills.slice();
     if (CREATOR_BAN && rc.creator && banned.has(rc.creator)) kills.push({ key: "creator banned (earlier rug)", detail: "creator banned (earlier rug)", hard: true });
     if (kills.length) {
       kills.forEach(k => tally("rugcheck", k.key));
       killLine("rugcheck", tk, kills.map(k => k.detail).join("; "));
-      if (kills.some(k => k.hard)) {                         // structural kill: remembered in the database, never looked at again
+      rec(p, "rugcheck", "killed", kills[0].key, f);
+      if (kills.some(k => k.hard)) {
         const ban = kills.some(k => k.ban);
         if (ban && rc.creator) banned.add(rc.creator);
         const tok = await tokenFor(S, p);
@@ -841,20 +1257,22 @@ async function scan(S, tick, refresh) {
       continue;
     }
     const a = analyst(p, rc);
-    const e = { p, rc, ...a };
-    if (a.veto.length) { a.veto.forEach(v => tally("analyst", "veto: " + v)); killLine("analyst", tk, "veto: " + a.veto.join("; ")); continue; }
+    const e = { p, rc, ...a, f, edge };
+    if (a.veto.length) { a.veto.forEach(v => tally("analyst", "veto: " + v)); killLine("analyst", tk, "veto: " + a.veto.join("; ")); rec(p, "analyst", "killed", "veto: " + a.veto[0], f); continue; }
     if (a.score < MIN_SCORE) {
       tally("analyst", `score below ${MIN_SCORE}`);
       killLine("analyst", tk, `score ${a.score} (< ${MIN_SCORE})`);
+      rec(p, "analyst", "killed", `score below ${MIN_SCORE}`, { ...f, score: a.score });
       if (a.score >= WATCH_MIN) await park(e, `score ${a.score}/100 below ${MIN_SCORE}, waiting. rugcheck: ${rc.note}. ${a.note}`);
       continue;
     }
+    rec(p, "analyst", "passed", "score ok", { ...f, score: a.score });
     passed.push(e);
   }
   passed.sort((a, b) => b.score - a.score);
   log(`desk: analyst passed ${passed.length} (score ${MIN_SCORE}+), fresh RugCheck reports ${fetched}`);
 
-  // ---- 5) EXECUTOR ----
+  // ---- 6) EXECUTOR ----
   step = "executor";
   for (const e of passed) {
     const ctx = liveCtx(S, cycles, banned);
@@ -864,13 +1282,14 @@ async function scan(S, tick, refresh) {
     if (r.ok) await refresh();
     else if (r.park) await park(e, r.park);
   }
+  try { await obsFlush(); } catch (e) { log("obs flush failed:", e.message); }
   killSummary();
 }
 
 // =====================================================================================
 // RISK: manage open positions (every POLL_SEC)
 // =====================================================================================
-const mem = new Map();   // tokenId -> { key, peak, last, lastSnap, missSince, liqHist }
+const mem = new Map();   // tokenId -> { key, peak, low, last, lastSnap, missSince, liqHist }
 let lastManageAt = 0;
 async function manage(S) {
   const t0 = Date.now();
@@ -889,7 +1308,7 @@ async function manage(S) {
     let m = mem.get(t.id);
     if (!m || m.key !== key) {
       const base = havePrice ? +pr.priceUsd : p.entry;
-      m = { key, peak: Math.max(base, await peakSince(t.id, p.firstAt)), last: base, lastSnap: 0, missSince: 0, liqHist: [] };
+      m = { key, peak: Math.max(base, await peakSince(t.id, p.firstAt)), low: Math.min(base, p.entry), last: base, lastSnap: 0, missSince: 0, liqHist: [] };
       mem.set(t.id, m);
     }
 
@@ -907,7 +1326,7 @@ async function manage(S) {
     const prev = m.last;
     let liqDrop = 0;
     if (havePrice) {
-      m.last = price; m.peak = Math.max(m.peak, price);
+      m.last = price; m.peak = Math.max(m.peak, price); m.low = Math.min(m.low, price);
       if (Date.now() - m.lastSnap >= SNAP_SEC * 1000) { await snapshot(t.id, pr); m.lastSnap = Date.now(); }
       const tn = Date.now();
       m.liqHist = m.liqHist.filter(h => tn - h.t <= LIQ_WINDOW_MIN * 60e3);
@@ -920,11 +1339,13 @@ async function manage(S) {
 
     // o.bl = blacklist the token, o.ban = also ban its creator
     const exitAll = async (why, o = {}) => {
+      const mfe = (m.peak / p.entry - 1) * 100, mae = (Math.min(m.low, price) / p.entry - 1) * 100;
       await paperSell(t.id, t.ticker, price, p.qty, why, liq);
       const bl = o.bl || x <= BL_LOSS;
-      await decide(t.id, "WYJŚĆ", `exit all (${why}) at ${x.toFixed(2)}x, peak ${peakX.toFixed(2)}x${bl ? " [BLACKLIST]" : ""}${o.ban ? " [CREATORBAN]" : ""}`);
-      log("EXIT", t.ticker, why, x.toFixed(4) + "x", "peak", peakX.toFixed(4) + "x", bl ? "-> BLACKLISTED" : "");
+      await decide(t.id, "WYJŚĆ", `exit all (${why}) at ${x.toFixed(2)}x, peak ${peakX.toFixed(2)}x, mfe=${mfe.toFixed(1)}% mae=${mae.toFixed(1)}%${bl ? " [BLACKLIST]" : ""}${o.ban ? " [CREATORBAN]" : ""}`);
+      log("EXIT", t.ticker, why, x.toFixed(4) + "x", "peak", peakX.toFixed(4) + "x", `mfe ${mfe.toFixed(1)}% mae ${mae.toFixed(1)}%`, bl ? "-> BLACKLISTED" : "");
       await notify(`EXIT ${t.ticker}: ${why} at ${x.toFixed(2)}x (peak ${peakX.toFixed(2)}x)`);
+      await obsTradeClosed(t.mint_address, { ret: round((x - 1) * 100, 2), mfe: round(mfe, 2), mae: round(mae, 2), why });
       mem.delete(t.id); changed = true;
     };
 
@@ -935,7 +1356,7 @@ async function manage(S) {
       continue;
     }
 
-    const rule = exitRule({ x, peakX, dropNow, soldFrac: p.bought > 0 ? p.sold / p.bought : 0 }, PARAMS);
+    const rule = exitRule({ x, peakX, dropNow, soldFrac: p.bought > 0 ? p.sold / p.bought : 0 }, EP);
     for (const pt of rule.partials) {
       const q = Math.min(p.qty, p.bought * pt.pct);
       if (q <= 1e-8) continue;
@@ -947,8 +1368,8 @@ async function manage(S) {
     if (rule.exit && p.qty > 1e-8) { await exitAll(rule.exit); continue; }
 
     const ageH = (Date.now() - p.firstAt) / 36e5;
-    if (TIME_STOP_H > 0 && ageH >= TIME_STOP_H && peakX < ARM_X && p.qty > 1e-8) {
-      await exitAll(`time stop: ${ageH.toFixed(1)}h without reaching +${Math.round((ARM_X - 1) * 100)}%`);
+    if (TIME_STOP_H > 0 && ageH >= TIME_STOP_H && peakX < EP.ARM_X && p.qty > 1e-8) {
+      await exitAll(`time stop: ${ageH.toFixed(1)}h without reaching +${Math.round((EP.ARM_X - 1) * 100)}%`);
       continue;
     }
 
@@ -959,7 +1380,7 @@ async function manage(S) {
 }
 
 // =====================================================================================
-// BACKTEST: replays saved price snapshots of past entries with many exit settings
+// BACKTEST: replays saved price snapshots of past real entries with many exit settings
 // =====================================================================================
 function entriesOf(S) {
   const sorted = S.trades.slice().sort((a, b) => new Date(a.executed_at) - new Date(b.executed_at));
@@ -977,21 +1398,6 @@ function entriesOf(S) {
     }
   }
   return out;
-}
-function simulate(series, entry, P) {
-  const cst = 1 - FEE - SLIP;
-  const q0 = cst; let q = cst, got = 0, peak = entry, prev = entry;
-  for (const pt of series) {
-    const x = pt.price / entry;
-    peak = Math.max(peak, pt.price);
-    const dropNow = prev > 0 ? (prev - pt.price) / prev * 100 : 0;
-    prev = pt.price;
-    const rule = exitRule({ x, peakX: peak / entry, dropNow, soldFrac: (q0 - q) / q0 }, P);
-    for (const w of rule.partials) { const s = Math.min(q, q0 * w.pct); got += s * x * cst; q -= s; }
-    if (rule.exit) { got += q * x * cst; q = 0; break; }
-  }
-  if (q > 1e-9) got += q * (series[series.length - 1].price / entry) * cst;
-  return got - 1;
 }
 async function backtest() {
   step = "backtest: load";
@@ -1014,14 +1420,12 @@ async function backtest() {
     return { sum, avg: sum / r.length, win: r.filter(v => v > 0).length / r.length, worst: Math.min(...r) };
   };
   const f = v => `total ${(v.sum * 100).toFixed(0)}%, avg ${(v.avg * 100).toFixed(1)}%/trade, win rate ${(v.win * 100).toFixed(0)}%, worst ${(v.worst * 100).toFixed(0)}%`;
-  log("BACKTEST", "CURRENT SETTINGS ->", f(evalP(PARAMS)));
+  log("BACKTEST", "CURRENT SETTINGS ->", f(evalP(EP)));
   const actual = closedCycles(S);
   if (actual.length) log("BACKTEST", `ACTUAL closed trades (${actual.length}) -> total ${(actual.reduce((s, c) => s + c.ret, 0) * 100).toFixed(0)}%, avg ${(actual.reduce((s, c) => s + c.ret, 0) / actual.length * 100).toFixed(1)}%/trade`);
 
-  const grid = { STOP: [0.90, 0.92, 0.94, 0.96], TRAIL_WIDE: [4, 6, 8], TRAIL_PCT: [4, 5, 7], PARTIAL_X: [1.3, 1.5, 2], FAST_DROP: [3, 4, 6], LOCK_FLOOR: [1.03, 1.06, 1.10] };
-  let combos = [{}];
-  for (const k of Object.keys(grid)) { const next = []; for (const c of combos) for (const v of grid[k]) next.push({ ...c, [k]: v }); combos = next; }
-  const res = combos.map(c => ({ c, ...evalP({ ...PARAMS, ...c }) })).sort((a, b) => b.sum - a.sum).slice(0, 10);
+  const combos = gridCombos(GRID);
+  const res = combos.map(c => ({ c, ...evalP({ ...EP, ...c }) })).sort((a, b) => b.sum - a.sum).slice(0, 10);
   log("BACKTEST", `TOP 10 of ${combos.length} combinations (env vars you can set):`);
   res.forEach((r, i) => log("BACKTEST", `#${i + 1} ${Object.entries(r.c).map(([k, v]) => k + "=" + v).join(" ")}  ->  ${f(r)}`));
   log("BACKTEST", "note: snapshots are ~60s apart and end at the real exit, so treat this as a rough guide, not a promise");
@@ -1032,11 +1436,13 @@ async function main() {
   step = "login";
   await login();
   if (process.argv.includes("--backtest")) { await backtest(); return; }
+  step = "init observations";
+  try { await obsInit(); await learnInit(); } catch (e) { OBS.ok = false; log("observations/learning init failed, running without learning:", e.message); }
   const minArg = process.argv.find(a => a.startsWith("--minutes="));
   const minutes = minArg ? +minArg.split("=")[1] : 0;
   const deadline = minutes > 0 ? Date.now() + minutes * 60e3 : Infinity;
-  log("bot v10 desk started (paper trading only) | mode", ONCE ? "once" : minutes ? minutes + " min loop" : "loop forever",
-    `| scout age ${Math.round(AGE_MIN_H * 60)}min-${AGE_MAX_H}h, mcap $${MC_MIN}-$${MC_MAX} | filter liq $${LIQ_MIN}, vol1h $${VOL1H_MIN}, top10 ${MAX_TOP10}%, dev ${MAX_DEV}%, bundled ${MAX_BUNDLED}% | analyst ${MIN_SCORE}+ | size ${MIN_TRADE_PCT * 100}-${MAX_TRADE_PCT * 100}% | stop -${Math.round((1 - STOP) * 100)}%, trail after +${Math.round((ARM_X - 1) * 100)}% | pullback ${pullbackOn ? "on" : "off"} | poll ${POLL_SEC}s | scan ${SCAN_SEC}s`);
+  log("bot v11 started (paper trading only) | mode", ONCE ? "once" : minutes ? minutes + " min loop" : "loop forever",
+    `| learning ${OBS.ok && LEARN_ON ? "ON (gate " + LEARN_GATE + ", exits " + (LEARN_EXITS ? "on" : "off") + ")" : "OFF"} | mood filter ${MOOD_ON ? "on" : "off"} | scout age ${Math.round(AGE_MIN_H * 60)}min-${AGE_MAX_H}h, mcap $${MC_MIN}-$${MC_MAX} | filter liq $${LIQ_MIN}, vol1h $${VOL1H_MIN}, top10 ${MAX_TOP10}%, dev ${MAX_DEV}%, bundled ${MAX_BUNDLED}% | analyst ${MIN_SCORE}+ | size ${MIN_TRADE_PCT * 100}-${MAX_TRADE_PCT * 100}% | stop -${Math.round((1 - EP.STOP) * 100)}%, trail after +${Math.round((EP.ARM_X - 1) * 100)}% | poll ${POLL_SEC}s | scan ${SCAN_SEC}s`);
   if (ONCE) {
     step = "load data";
     const S1 = await load();
@@ -1046,6 +1452,7 @@ async function main() {
     const S2 = await load();
     step = "scan";
     await scan(S2, null, async () => { Object.assign(S2, await load()); });
+    try { await obsPersist(true); await learnCycle(null); } catch (e) { log("learning step failed:", e.message); }
     step = "stats";
     const S3 = await load();
     stats(S3);
@@ -1065,7 +1472,7 @@ async function main() {
     }, 60e3).unref();
   }
   const today0 = new Date().toISOString().slice(0, 10);
-  let S = null, lastLoad = 0, lastScan = 0, lastTick = 0;
+  let S = null, lastLoad = 0, lastScan = 0, lastTick = 0, lastFollow = 0, lastPersist = Date.now(), lastLearn = 0;
   let lastReportDay = new Date().getUTCHours() >= REPORT_HOUR ? today0 : "";
   const reload = async () => {
     const fresh = await load();
@@ -1078,6 +1485,7 @@ async function main() {
       try { await login(); log("re-login ok"); } catch (e2) { log("re-login failed:", e2.message); }
     }
   };
+  const safe = async (label, fn) => { try { await fn(); } catch (e) { await onErr(label + " error:", e); } };
   const tick = async () => {
     beat = Date.now();
     if (!S || Date.now() - lastTick < POLL_SEC * 1000) return;
@@ -1100,11 +1508,18 @@ async function main() {
         await reload();
         stats(S);
       }
-      const d = new Date(), day = d.toISOString().slice(0, 10);
-      if (d.getUTCHours() >= REPORT_HOUR && lastReportDay !== day) { await report(S); lastReportDay = day; }
     } catch (e) { await onErr("cycle error:", e); }
+    // learning jobs run separately, so a failure here never stops trading
+    if (OBS.ok && Date.now() - lastFollow > FOLLOW_SEC * 1000 && Date.now() < deadline - 90e3) { lastFollow = Date.now(); await safe("follow", () => obsFollow(tick)); }
+    if (OBS.ok && Date.now() - lastPersist > PERSIST_SEC * 1000) { lastPersist = Date.now(); await safe("persist", () => obsPersist(true)); }
+    if (OBS.ok && LEARN_ON && Date.now() - lastLearn > LEARN_SEC * 1000 && Date.now() < deadline - 120e3) { lastLearn = Date.now(); beat = Date.now(); await safe("learn", () => learnCycle(tick)); }
+    try {
+      const d = new Date(), day = d.toISOString().slice(0, 10);
+      if (S && d.getUTCHours() >= REPORT_HOUR && lastReportDay !== day) { await report(S); lastReportDay = day; }
+    } catch (e) { await onErr("report error:", e); }
     await sleep(Math.max(0, Math.min(POLL_SEC * 1000, deadline - Date.now())));
   }
+  await safe("final persist", () => obsPersist(true));
   log("time window finished, exiting (open positions stay in the database and are picked up by the next run)");
 }
 main().catch(e => {
