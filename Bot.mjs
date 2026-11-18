@@ -1,6 +1,5 @@
-// MemeLab AI — paper trading bot v11 "desk + learning" (NO real money, NO wallet, NO private keys)
+// MemeLab AI — paper trading bot v11.1 "desk + learning + profit lock" (NO real money, NO wallet, NO private keys)
 // Agents: Scout -> Filter -> Mood -> Learner gate -> RugCheck -> Analyst -> Executor -> Risk -> Logger
-// v11 adds:
 //   * OBSERVATIONS: every coin the bot sees is saved in the database (bot_observations) with its features,
 //     and its price is followed for HORIZON_H hours, also for coins that were REJECTED (so we learn if the filters help)
 //   * LEARNER (every LEARN_SEC): learns from those outcomes (simulated with the bot's own exit rules)
@@ -9,8 +8,9 @@
 //       - reports: kill value of every filter, best/worst buckets, by hour, by source, MFE/MAE of real trades
 //   * MARKET MOOD filter: no entries when the scanned market is clearly falling
 //   * MFE/MAE of every real trade is saved
+//   * PROFIT LOCK (v11.1): once the price has been +10% above entry, a 3.5% fall from the peak closes the position
 //   Learning code is wrapped in try/catch: if it fails, trading continues as before.
-// Needs the SQL for bot_observations and bot_learning (see the chat). Without it the bot runs without learning.
+// Needs the SQL for bot_observations and bot_learning. Without it the bot runs without learning.
 // Run:  npm i @supabase/supabase-js
 //   node Bot.mjs --minutes=345   (loop for N minutes, then exit; GitHub Actions 24/7)
 //   node Bot.mjs                 (loop forever)
@@ -80,30 +80,30 @@ const SMART = new Set((process.env.SMART_WALLETS || "").split(",").map(s => s.tr
 
 // -- MARKET MOOD (computed from the coins scanned in each scan) --
 const MOOD_ON = num("MOOD_ON", 1);
-const MOOD_BLOCK_MEDIAN = num("MOOD_BLOCK_MEDIAN", -8);     // block entries when the median 1h change of active coins is below this %
-const MOOD_BLOCK_BREADTH = num("MOOD_BLOCK_BREADTH", 0.25); // ...or when fewer than this share of active coins is up in 1h
-const MOOD_MIN_PAIRS = num("MOOD_MIN_PAIRS", 15);           // mood is only trusted with at least this many active coins
+const MOOD_BLOCK_MEDIAN = num("MOOD_BLOCK_MEDIAN", -8);
+const MOOD_BLOCK_BREADTH = num("MOOD_BLOCK_BREADTH", 0.25);
+const MOOD_MIN_PAIRS = num("MOOD_MIN_PAIRS", 15);
 
 // -- OBSERVATIONS (every coin seen is saved and followed) --
 const OBS_ON = num("OBS_ON", 1);
-const HORIZON_H = num("HORIZON_H", 3);                      // how long the price of each coin is followed
-const FOLLOW_SEC = num("FOLLOW_SEC", 300);                  // price check interval for followed coins
-const PERSIST_SEC = num("PERSIST_SEC", 900);                // how often followed paths are written to the database
-const OBS_DEDUPE_H = num("OBS_DEDUPE_H", 3);                // the same coin is not saved again within this time (unless it got further)
+const HORIZON_H = num("HORIZON_H", 3);
+const FOLLOW_SEC = num("FOLLOW_SEC", 300);
+const PERSIST_SEC = num("PERSIST_SEC", 900);
+const OBS_DEDUPE_H = num("OBS_DEDUPE_H", 3);
 const OBS_MAX_PER_SCAN = num("OBS_MAX_PER_SCAN", 400);
-const MAX_FOLLOW = num("MAX_FOLLOW", 500);                  // max coins followed at the same time
-const MISSING_N = num("MISSING_N", 3);                      // pair gone for this many checks in a row = dead (-95%)
+const MAX_FOLLOW = num("MAX_FOLLOW", 500);
+const MISSING_N = num("MISSING_N", 3);
 
 // -- LEARNER --
 const LEARN_ON = num("LEARN", 1);
 const LEARN_SEC = num("LEARN_SEC", 1800);
 const LEARN_DAYS = num("LEARN_DAYS", 14);
-const LEARN_MIN_OBS = num("LEARN_MIN_OBS", 120);            // resolved coins needed before the entry model is built
-const LEARN_MIN_EXIT = num("LEARN_MIN_EXIT", 100);          // resolved coins needed before exits are tuned
-const LEARN_K = num("LEARN_K", 15);                         // shrinkage: small buckets are pulled towards the average
-const LEARN_MIN_EDGE = num("LEARN_MIN_EDGE", 0);            // learned expected return (fraction) a coin needs, 0 = break-even
+const LEARN_MIN_OBS = num("LEARN_MIN_OBS", 120);
+const LEARN_MIN_EXIT = num("LEARN_MIN_EXIT", 100);
+const LEARN_K = num("LEARN_K", 15);
+const LEARN_MIN_EDGE = num("LEARN_MIN_EDGE", 0);
 const LEARN_GATE = (process.env.LEARN_GATE || "auto").toLowerCase();   // auto = block when validated | shadow = only log | off
-const LEARN_EXITS = num("LEARN_EXITS", 1);                  // 1 = may adopt better exit settings (validated on newer data)
+const LEARN_EXITS = num("LEARN_EXITS", 1);
 const LEARN_EXIT_COOLDOWN_H = num("LEARN_EXIT_COOLDOWN_H", 6);
 
 // -- optional pullback entry (off by default) --
@@ -126,6 +126,8 @@ const TIER_HI_X = num("TIER_HI_X", 3);
 const LOCK_X = num("LOCK_X", 1.30);
 const LOCK_FLOOR = num("LOCK_FLOOR", 1.06);
 const FAST_DROP = num("FAST_DROP", 4);
+const PL_X = num("PL_X", 1.10);          // once the price has been +10% above entry...
+const PL_DROP = num("PL_DROP", 3.5);     // ...sell everything when it falls this % below the peak (0 = off)
 const PARTIAL_X = num("PARTIAL_X", 1.5);
 const PARTIAL_PCT = num("PARTIAL_PCT", 0.5);
 const PARTIAL2_X = num("PARTIAL2_X", 3);
@@ -157,7 +159,7 @@ const WATCHDOG_MIN = num("WATCHDOG_MIN", 10);
 // ========================================================================================
 
 // EP = the exit parameters that are really used (start = settings above, the learner may move some of them within BOUNDS)
-const EP = { STOP, ARM_X, TRAIL_WIDE, TRAIL_LOCK, TRAIL_PCT, TRAIL_TIGHT, TIER_LO_X, TIER_HI_X, LOCK_X, LOCK_FLOOR, FAST_DROP, PARTIAL_X, PARTIAL_PCT, PARTIAL2_X, PARTIAL2_PCT };
+const EP = { STOP, ARM_X, TRAIL_WIDE, TRAIL_LOCK, TRAIL_PCT, TRAIL_TIGHT, TIER_LO_X, TIER_HI_X, LOCK_X, LOCK_FLOOR, FAST_DROP, PL_X, PL_DROP, PARTIAL_X, PARTIAL_PCT, PARTIAL2_X, PARTIAL2_PCT };
 const BOUNDS = { STOP: [0.85, 0.97], TRAIL_WIDE: [3, 12], TRAIL_PCT: [3, 8], PARTIAL_X: [1.2, 2.5], FAST_DROP: [2, 8], LOCK_FLOOR: [1.02, 1.12] };
 const GRID = { STOP: [0.88, 0.92, 0.94, 0.96], TRAIL_WIDE: [4, 6, 8], TRAIL_PCT: [4, 5, 7], PARTIAL_X: [1.3, 1.5, 2], FAST_DROP: [3, 4, 6], LOCK_FLOOR: [1.03, 1.06, 1.10] };
 const pullbackOn = !!PULLBACK && !ONCE;
@@ -655,6 +657,7 @@ function exitCategory(reason) {
   if (/liquidity dropped/i.test(r)) return "liquidity drop";
   if (/no price data/i.test(r)) return "dead pair";
   if (/sudden drop/i.test(r)) return "sudden drop";
+  if (/profit lock/i.test(r)) return "profit lock";
   if (/profit floor/i.test(r)) return "profit floor";
   if (/trailing stop/i.test(r)) return "trailing stop";
   if (/time stop/i.test(r)) return "time stop";
@@ -746,6 +749,7 @@ function exitRule(s, P) {
   if (P.PARTIAL_PCT > 0 && !done1 && x >= P.PARTIAL_X) partials.push({ pct: P.PARTIAL_PCT, at: P.PARTIAL_X });
   if (P.PARTIAL2_PCT > 0 && !done2 && x >= P.PARTIAL2_X) partials.push({ pct: P.PARTIAL2_PCT, at: P.PARTIAL2_X });
   const locked = peakX >= P.LOCK_X;
+  if (P.PL_DROP > 0 && peakX >= P.PL_X && x <= peakX * (1 - P.PL_DROP / 100)) return { exit: `profit lock ${P.PL_DROP}% below peak ${peakX.toFixed(4)}x`, partials, locked };
   if (locked && dropNow >= P.FAST_DROP) return { exit: `sudden drop ${dropNow.toFixed(1)}% after reaching ${peakX.toFixed(2)}x`, partials, locked };
   if (locked && x <= P.LOCK_FLOOR) return { exit: `profit floor ${P.LOCK_FLOOR}x after peak ${peakX.toFixed(2)}x`, partials, locked };
   let trailPct = null;
@@ -1095,7 +1099,7 @@ async function enter(S, e, ctx, how) {
   await paperBuy(tok.id, tok.ticker, price, usd, e.p.liquidity?.usd || 0);
   await decide(tok.id, "WEJŚĆ",
     `score ${e.score}/100, tier ${e.tier}, size $${usd.toFixed(2)} (${(usd / ctx.equity * 100).toFixed(1)}% of portfolio, base ${(pct * 100).toFixed(1)}%). entry: ${how}. stop set before entry at $${(price * EP.STOP).toPrecision(5)} (-${Math.round((1 - EP.STOP) * 100)}%). learned edge ${e.edge === null || e.edge === undefined ? "n/a" : pc(e.edge)}, mood ${fmt1(MOOD.median)}%. rugcheck: ${e.rc?.note || "n/a"}. creator:${e.rc?.creator || "unknown"}. ${e.note}`,
-    `Stop -${Math.round((1 - EP.STOP) * 100)}%; trailing after +${Math.round((EP.ARM_X - 1) * 100)}% (${EP.TRAIL_WIDE}/${EP.TRAIL_LOCK}/${EP.TRAIL_PCT}/${EP.TRAIL_TIGHT}%); sell ${Math.round(EP.PARTIAL_PCT * 100)}% at ${EP.PARTIAL_X}x and ${Math.round(EP.PARTIAL2_PCT * 100)}% at ${EP.PARTIAL2_X}x; floor ${EP.LOCK_FLOOR}x from +${Math.round((EP.LOCK_X - 1) * 100)}%; liquidity drop ${LIQ_DROP}%/${LIQ_WINDOW_MIN}min; time stop ${TIME_STOP_H}h`,
+    `Stop -${Math.round((1 - EP.STOP) * 100)}%; profit lock: after +${Math.round((EP.PL_X - 1) * 100)}% sell on a ${EP.PL_DROP}% drop from the peak; trailing after +${Math.round((EP.ARM_X - 1) * 100)}% (${EP.TRAIL_WIDE}/${EP.TRAIL_LOCK}/${EP.TRAIL_PCT}/${EP.TRAIL_TIGHT}%); sell ${Math.round(EP.PARTIAL_PCT * 100)}% at ${EP.PARTIAL_X}x and ${Math.round(EP.PARTIAL2_PCT * 100)}% at ${EP.PARTIAL2_X}x; floor ${EP.LOCK_FLOOR}x from +${Math.round((EP.LOCK_X - 1) * 100)}%; liquidity drop ${LIQ_DROP}%/${LIQ_WINDOW_MIN}min; time stop ${TIME_STOP_H}h`,
     `Tier ${e.tier}. Memecoin: can go to zero.`);
   await obsEntered(e.p, e.f, usd);
   log("ENTER", tok.ticker, "score", e.score, "tier", e.tier, "size $" + usd.toFixed(2), "edge", e.edge === null || e.edge === undefined ? "n/a" : pc(e.edge), "|", how);
@@ -1374,7 +1378,7 @@ async function manage(S) {
     }
 
     if (rule.trailPct) log("HOLD", t.ticker, x.toFixed(4) + "x", "peak", peakX.toFixed(4) + "x", `(trail ${rule.trailPct}%${rule.locked ? ", profit locked" : ""})`);
-    else log("HOLD (not armed)", t.ticker, x.toFixed(4) + "x", `age ${ageH.toFixed(1)}h`);
+    else log("HOLD", t.ticker, x.toFixed(4) + "x", "peak", peakX.toFixed(4) + "x", `age ${ageH.toFixed(1)}h${peakX >= EP.PL_X ? ", profit lock armed" : ""}`);
   }
   return changed;
 }
@@ -1421,6 +1425,7 @@ async function backtest() {
   };
   const f = v => `total ${(v.sum * 100).toFixed(0)}%, avg ${(v.avg * 100).toFixed(1)}%/trade, win rate ${(v.win * 100).toFixed(0)}%, worst ${(v.worst * 100).toFixed(0)}%`;
   log("BACKTEST", "CURRENT SETTINGS ->", f(evalP(EP)));
+  log("BACKTEST", "WITHOUT profit lock ->", f(evalP({ ...EP, PL_DROP: 0 })));
   const actual = closedCycles(S);
   if (actual.length) log("BACKTEST", `ACTUAL closed trades (${actual.length}) -> total ${(actual.reduce((s, c) => s + c.ret, 0) * 100).toFixed(0)}%, avg ${(actual.reduce((s, c) => s + c.ret, 0) / actual.length * 100).toFixed(1)}%/trade`);
 
@@ -1441,8 +1446,8 @@ async function main() {
   const minArg = process.argv.find(a => a.startsWith("--minutes="));
   const minutes = minArg ? +minArg.split("=")[1] : 0;
   const deadline = minutes > 0 ? Date.now() + minutes * 60e3 : Infinity;
-  log("bot v11 started (paper trading only) | mode", ONCE ? "once" : minutes ? minutes + " min loop" : "loop forever",
-    `| learning ${OBS.ok && LEARN_ON ? "ON (gate " + LEARN_GATE + ", exits " + (LEARN_EXITS ? "on" : "off") + ")" : "OFF"} | mood filter ${MOOD_ON ? "on" : "off"} | scout age ${Math.round(AGE_MIN_H * 60)}min-${AGE_MAX_H}h, mcap $${MC_MIN}-$${MC_MAX} | filter liq $${LIQ_MIN}, vol1h $${VOL1H_MIN}, top10 ${MAX_TOP10}%, dev ${MAX_DEV}%, bundled ${MAX_BUNDLED}% | analyst ${MIN_SCORE}+ | size ${MIN_TRADE_PCT * 100}-${MAX_TRADE_PCT * 100}% | stop -${Math.round((1 - EP.STOP) * 100)}%, trail after +${Math.round((EP.ARM_X - 1) * 100)}% | poll ${POLL_SEC}s | scan ${SCAN_SEC}s`);
+  log("bot v11.1 started (paper trading only) | mode", ONCE ? "once" : minutes ? minutes + " min loop" : "loop forever",
+    `| learning ${OBS.ok && LEARN_ON ? "ON (gate " + LEARN_GATE + ", exits " + (LEARN_EXITS ? "on" : "off") + ")" : "OFF"} | mood filter ${MOOD_ON ? "on" : "off"} | profit lock ${EP.PL_DROP > 0 ? `after +${Math.round((EP.PL_X - 1) * 100)}%, ${EP.PL_DROP}% drop from peak` : "off"} | scout age ${Math.round(AGE_MIN_H * 60)}min-${AGE_MAX_H}h, mcap $${MC_MIN}-$${MC_MAX} | filter liq $${LIQ_MIN}, vol1h $${VOL1H_MIN}, top10 ${MAX_TOP10}%, dev ${MAX_DEV}%, bundled ${MAX_BUNDLED}% | analyst ${MIN_SCORE}+ | size ${MIN_TRADE_PCT * 100}-${MAX_TRADE_PCT * 100}% | stop -${Math.round((1 - EP.STOP) * 100)}%, trail after +${Math.round((EP.ARM_X - 1) * 100)}% | poll ${POLL_SEC}s | scan ${SCAN_SEC}s`);
   if (ONCE) {
     step = "load data";
     const S1 = await load();
