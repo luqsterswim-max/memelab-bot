@@ -5,7 +5,7 @@
 //           | rug exits (liquidity drop / dead pair) | time stop for coins that go nowhere
 //   LEARN : follows every coin that passed the filters, simulates your exit rules on it, learns P(win) from those
 //           and from the bot's own real trades (its mistakes weigh 3x). Once a model is validated on newer data it
-//           trades only coins with P(win) >= WIN_TARGET (0.75). Before that: explore mode (safest coins, small size).
+//           trades only coins with P(win) >= WIN_TARGET (0.75). Before that: explore mode (safest coins).
 // Needs the Supabase tables bot_observations and bot_learning (same SQL as before). Without them: explore mode only.
 // Run:  npm i @supabase/supabase-js
 //   node Bot.mjs --minutes=345   loop for N minutes (GitHub Actions, 24/7)
@@ -39,12 +39,15 @@ const NOPRICE_RECOVERY = num("NOPRICE_RECOVERY", 0.05);   // simulated sell pric
 const POLL_SEC = num("POLL_SEC", 20);             // how often open positions are checked
 const SNAP_SEC = num("SNAP_SEC", 60);             // how often a price snapshot of an open position is saved
 
-// -- POSITION SIZE: the lower the risk, the bigger the position (linear between the two points) --
-const RISK_A = num("RISK_A", 9), SIZE_A = num("SIZE_A", 200);    // risk 9  -> $200 (maximum)
-const RISK_B = num("RISK_B", 78), SIZE_B = num("SIZE_B", 30);    // risk 78 -> $30
+// -- POSITION SIZE: by risk bands, linear inside every band --
+//    risk 0-15  -> $300 down to $150
+//    risk 16-35 -> $100 down to $60
+//    risk 36-65 -> $50 down to $40
+//    risk 66+   -> $30 down to $10 (max $30)
+const SIZE_PTS = [[0, 300], [15, 150], [16, 100], [35, 60], [36, 50], [65, 40], [66, 30], [100, 10]];   // [risk, USD]
 const RISK_CUT = num("RISK_CUT", 85);             // risk above this = never buy
 const MIN_USD = num("MIN_USD", 10);
-const MAX_POS_PCT = num("MAX_POS_PCT", 0.05);     // one position never exceeds this share of equity
+const MAX_POS_PCT = num("MAX_POS_PCT", 0.35);     // one position never exceeds this share of CURRENT equity (cash + open positions), so it grows and shrinks with the account
 const MAX_EXPOSURE = num("MAX_EXPOSURE", 0.60);   // all positions together never exceed this share of equity
 const MAX_LIQ_PCT = num("MAX_LIQ_PCT", 0.02);     // one position never exceeds this share of the token's liquidity
 const MAX_OPEN = num("MAX_OPEN", 10);
@@ -89,7 +92,7 @@ const WIN_TARGET = num("WIN_TARGET", 0.75);       // wanted win rate: the model 
 const GATE_TOL = num("GATE_TOL", 0.05);           // validation passes at WIN_TARGET minus this
 const GATE_MIN_N = num("GATE_MIN_N", 12);         // min accepted coins in the validation set
 const EXPLORE_MAX_RISK = num("EXPLORE_MAX_RISK", 40);   // explore mode: only coins up to this risk...
-const EXPLORE_SIZE_MULT = num("EXPLORE_SIZE_MULT", 0.3); // ...with this share of the normal size
+const EXPLORE_SIZE_MULT = num("EXPLORE_SIZE_MULT", 1);  // ...with this share of the normal size (1 = full size from the risk curve)
 const LEARN_ON = num("LEARN", 1);
 const LEARN_SEC = num("LEARN_SEC", 1800);
 const LEARN_DAYS = num("LEARN_DAYS", 14);
@@ -406,11 +409,16 @@ function riskScore(p, rc, same) {
   const sum = Object.values(parts).reduce((s, v) => s + v, 0);
   return { risk: clamp(Math.round(sum / RISK_MAX_SUM * 100), 0, 100), parts };
 }
-function sizeUsd(risk) {                            // risk 9 -> $200, risk 78 -> $30, linear in between, never below MIN_USD
-  const raw = risk <= RISK_A ? SIZE_A : SIZE_A + (SIZE_B - SIZE_A) * (risk - RISK_A) / (RISK_B - RISK_A);
-  return clamp(raw, MIN_USD, SIZE_A);
+function sizeUsd(risk) {                            // size by risk bands (SIZE_PTS), linear inside a band, never below MIN_USD
+  const r = clamp(risk, 0, 100);
+  let raw = SIZE_PTS[SIZE_PTS.length - 1][1];
+  for (let i = 0; i < SIZE_PTS.length - 1; i++) {
+    const [r1, v1] = SIZE_PTS[i], [r2, v2] = SIZE_PTS[i + 1];
+    if (r >= r1 && r <= r2) { raw = v1 + (v2 - v1) * (r - r1) / (r2 - r1); break; }
+  }
+  return clamp(raw, MIN_USD, SIZE_PTS[0][1]);
 }
-function sizeFor(risk, liq, ctx, mult) {
+function sizeFor(risk, liq, ctx, mult) {            // ctx.equity = CURRENT cash + open positions, so the % cap follows the account
   let usd = sizeUsd(risk) * mult;
   usd = Math.min(usd, ctx.equity * MAX_POS_PCT, liq * MAX_LIQ_PCT, ctx.equity * MAX_EXPOSURE - ctx.invested, ctx.cash);
   usd = Math.floor(usd * 100) / 100;
@@ -1049,13 +1057,16 @@ async function selftest() {
   ok("trail sells on a 4.5% fall from the peak", /profit trail/.test(exitCheck(1.06, 1.12, 1) || "") && exitCheck(1.08, 1.12, 1) === null);
   ok("no trail before +10%", exitCheck(1.04, 1.09, 1) === null);
   ok("time stop only for coins that never reached +10%", /time stop/.test(exitCheck(1.0, 1.05, 30) || "") && exitCheck(1.2, 1.2, 30) === null);
-  ok("size: risk 9 -> $200", Math.abs(sizeUsd(9) - 200) < 1e-6);
-  ok("size: risk 78 -> $30", Math.abs(sizeUsd(78) - 30) < 1e-6);
-  ok("size: lower risk = bigger position", sizeUsd(20) > sizeUsd(50) && sizeUsd(50) > sizeUsd(70));
+  ok("size: risk 0 -> $300, risk 15 -> $150", Math.abs(sizeUsd(0) - 300) < 1e-6 && Math.abs(sizeUsd(15) - 150) < 1e-6);
+  ok("size: risk 16 -> $100, risk 35 -> $60", Math.abs(sizeUsd(16) - 100) < 1e-6 && Math.abs(sizeUsd(35) - 60) < 1e-6);
+  ok("size: risk 36 -> $50, risk 65 -> $40", Math.abs(sizeUsd(36) - 50) < 1e-6 && Math.abs(sizeUsd(65) - 40) < 1e-6);
+  ok("size: risk 66 -> $30, above 65 never over $30", Math.abs(sizeUsd(66) - 30) < 1e-6 && sizeUsd(80) <= 30 && sizeUsd(85) <= 30);
+  ok("size: lower risk = bigger position", sizeUsd(10) > sizeUsd(20) && sizeUsd(20) > sizeUsd(50) && sizeUsd(50) > sizeUsd(70));
   ok("size never below minimum", sizeUsd(100) === MIN_USD);
   const ctx = { equity: 10000, invested: 0, cash: 10000 };
   ok("size capped by liquidity (2%)", sizeFor(9, 5000, ctx, 1) === 100);
   ok("size capped by cash", sizeFor(9, 1e6, { equity: 10000, invested: 0, cash: 50 }, 1) === 50);
+  ok("size cap follows current equity (35%)", sizeFor(0, 1e7, { equity: 400, invested: 0, cash: 400 }, 1) === 140 && sizeFor(0, 1e7, { equity: 2000, invested: 0, cash: 2000 }, 1) === 300);
   const p = { baseToken: { address: "A", symbol: "X" }, liquidity: { usd: 500000 }, marketCap: 3000000, volume: { h1: 200000 }, pairCreatedAt: Date.now() - 20 * 36e5, txns: { h1: { buys: 300, sells: 250 } }, priceChange: { h1: 5, m5: 1 }, info: { socials: [1] } };
   const good = riskScore(p, { m: { top10: 5, dev: 0, bundled: 0, lp: 100, holders: 3000, creatorTokens: 1 } }, 0);
   const badc = riskScore({ ...p, liquidity: { usd: 41000 }, marketCap: 400000, info: {}, pairCreatedAt: Date.now() - 36e5 }, { m: { top10: 24, dev: 2.9, bundled: 9, lp: 72, holders: 60, creatorTokens: 6 } }, 4);
@@ -1099,7 +1110,7 @@ async function main() {
   const minutes = minArg ? +minArg.split("=")[1] : 0;
   const deadline = minutes > 0 ? Date.now() + minutes * 60e3 : Infinity;
   log("bot v12 started (paper trading only) | mode", ONCE ? "once" : minutes ? minutes + " min loop" : "loop forever",
-    `| exits: stop -${Math.round((1 - STOP) * 100)}%, hold after +${Math.round((ARM_X - 1) * 100)}% and sell on a ${TRAIL_DROP}% fall from the peak | size: risk ${RISK_A} -> $${SIZE_A}, risk ${RISK_B} -> $${SIZE_B}, cut at ${RISK_CUT} | gate ${GATE_MODE}, target win rate ${WIN_TARGET * 100}% | learning ${OBS.ok && LEARN_ON ? "ON" : "OFF"} | poll ${POLL_SEC}s, scan ${SCAN_SEC}s`);
+    `| exits: stop -${Math.round((1 - STOP) * 100)}%, hold after +${Math.round((ARM_X - 1) * 100)}% and sell on a ${TRAIL_DROP}% fall from the peak | size: $${SIZE_PTS[0][1]} at risk 0 down to $${SIZE_PTS[SIZE_PTS.length - 1][1]} at risk 100 (bands), max ${MAX_POS_PCT * 100}% of equity per position, cut at risk ${RISK_CUT} | gate ${GATE_MODE}, explore size x${EXPLORE_SIZE_MULT}, target win rate ${WIN_TARGET * 100}% | learning ${OBS.ok && LEARN_ON ? "ON" : "OFF"} | poll ${POLL_SEC}s, scan ${SCAN_SEC}s`);
 
   let S = null, lastLoad = 0, lastScan = 0, lastTick = 0, lastFollow = 0, lastPersist = Date.now(), lastLearn = 0, beat = Date.now(), busy = false;
   let lastReportDay = new Date().getUTCHours() >= REPORT_HOUR ? new Date().toISOString().slice(0, 10) : "";
